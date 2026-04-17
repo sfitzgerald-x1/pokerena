@@ -1,0 +1,13 @@
+services:
+  pokerena-server:
+    build:
+      context: .
+    command: ["python", "-m", "pokerena", "server", "up", "--config", "config/server.local.yaml"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./.runtime:/app/.runtime
+      - ./config/server.local.yaml:/app/config/server.local.yaml:ro
+      - ./config/agents.yaml:/app/config/agents.yaml:ro
+      - ./.env:/app/.env:ro
+

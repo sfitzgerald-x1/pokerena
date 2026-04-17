@@ -1,0 +1,9 @@
+showdown_path: vendor/pokemon-showdown
+bind_address: 0.0.0.0
+port: 8000
+server_id: pokerena-local
+public_origin: http://localhost:8000
+no_security: true
+data_dir: .runtime/showdown/data
+log_dir: .runtime/showdown/logs
+

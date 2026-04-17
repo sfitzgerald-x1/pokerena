@@ -1,0 +1,14 @@
+agents:
+  - id: example-randbat-bot
+    enabled: false
+    format_allowlist:
+      - gen9randombattle
+    transport: subprocess
+    launch:
+      command: python3.14
+      args:
+        - -m
+        - my_agent_module
+      cwd: .
+    env_file: .env
+

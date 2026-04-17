@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python package
+        run: python -m pip install --upgrade pip && python -m pip install .
+
+      - name: Install Showdown dependencies
+        run: ./scripts/bootstrap-showdown.sh
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Render generated config
+        run: python -m pokerena server render-config --config config/server.local.example.yaml
+
