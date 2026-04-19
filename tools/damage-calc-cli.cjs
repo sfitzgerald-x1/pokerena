@@ -40,6 +40,12 @@ function optionalObject(value, label) {
   return requireObject(value, label);
 }
 
+function requireSchemaVersion(value) {
+  if (value !== 'pokerena.damage-request.v1') {
+    fail("schema_version must be 'pokerena.damage-request.v1'.");
+  }
+}
+
 function normalizeDamage(damage) {
   if (typeof damage === 'number') {
     return damage;
@@ -85,6 +91,7 @@ async function main() {
   }
 
   const data = requireObject(payload, 'payload');
+  requireSchemaVersion(data.schema_version);
   const generation = data.generation;
   if (!Number.isInteger(generation) || generation < 1) {
     fail('generation must be a positive integer.');

@@ -30,6 +30,8 @@ from .agent import (
 from .calc import (
     CALC_DEPENDENCY_PATH,
     CALC_SCRIPT_PATH,
+    DEFAULT_CALC_TIMEOUT_SECONDS,
+    detect_project_root,
     read_damage_calc_input,
     run_damage_calc,
     sample_damage_calc_payload,
@@ -120,6 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--stdin",
         action="store_true",
         help="Read the damage calculation request JSON from stdin.",
+    )
+    damage_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_CALC_TIMEOUT_SECONDS,
+        help="How long to wait for the local Node damage calc process before failing.",
     )
 
     agent_parser = subparsers.add_parser("agent", help="Manage the battle-agent runtime.")
@@ -314,11 +322,16 @@ def run_up(args: argparse.Namespace) -> int:
 
 
 def run_calc_damage(args: argparse.Namespace) -> int:
+    project_root = detect_project_root()
     payload = read_damage_calc_input(
         input_path=args.input,
         use_stdin=args.stdin,
     )
-    result = run_damage_calc(payload, project_root=Path.cwd())
+    result = run_damage_calc(
+        payload,
+        project_root=project_root,
+        timeout_seconds=args.timeout,
+    )
     print(json.dumps(result, indent=2))
     return 0
 
@@ -636,18 +649,28 @@ def collect_doctor_checks(
             detail=str(calc_dependency) if calc_dependency.exists() else f"missing {calc_dependency}",
         )
     )
-    if calc_script.exists() and calc_dependency.exists() and _is_supported_node_version(version):
+    if node_binary is None:
+        detail = "install Node.js 22+ and rerun ./scripts/bootstrap-node-deps.sh"
+        ok = False
+    elif not _is_supported_node_version(version):
+        detail = f"upgrade Node.js to 22+ (found {version})"
+        ok = False
+    elif not calc_script.exists() or not calc_dependency.exists():
+        detail = "install root node dependencies with ./scripts/bootstrap-node-deps.sh"
+        ok = False
+    else:
         try:
-            smoke_result = run_damage_calc(sample_damage_calc_payload(), project_root=project_root)
+            smoke_result = run_damage_calc(
+                sample_damage_calc_payload(),
+                project_root=project_root,
+                timeout_seconds=DEFAULT_CALC_TIMEOUT_SECONDS,
+            )
             calc_range = smoke_result.get("range", {})
             detail = f"range {calc_range.get('min')}-{calc_range.get('max')}"
             ok = True
         except ConfigError as error:
             detail = str(error)
             ok = False
-    else:
-        detail = "install root node dependencies with ./scripts/bootstrap-node-deps.sh"
-        ok = False
     results.append(
         CheckResult(
             name="calc-smoke",

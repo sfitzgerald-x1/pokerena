@@ -125,6 +125,7 @@ The input shape is intentionally narrow for v1:
 
 ```json
 {
+  "schema_version": "pokerena.damage-request.v1",
   "generation": 2,
   "attacker": {
     "species": "Snorlax",
@@ -149,6 +150,7 @@ The input shape is intentionally narrow for v1:
 
 The wrapper returns JSON with:
 
+- `schema_version`
 - `damage`
 - `range`
 - `range_percent`
@@ -156,6 +158,8 @@ The wrapper returns JSON with:
 - `knockout`
 
 Agents should call `python3.14 -m pokerena calc damage`, not `node`, so the command surface stays stable even if the underlying Node implementation changes later.
+
+The deprecated `./scripts/bootstrap-showdown.sh` path still forwards to `./scripts/bootstrap-node-deps.sh` for now, so existing local setup notes keep working while the new name settles in.
 
 ## Agent Runtime
 

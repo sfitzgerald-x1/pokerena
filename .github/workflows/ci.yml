@@ -34,5 +34,5 @@ jobs:
 
       - name: Smoke test damage calc
         run: |
-          printf '%s\n' '{"generation":2,"attacker":{"species":"Snorlax","options":{"level":100}},"defender":{"species":"Raikou","options":{"level":100}},"move":{"name":"Double-Edge"},"field":{}}' \
+          printf '%s\n' '{"schema_version":"pokerena.damage-request.v1","generation":2,"attacker":{"species":"Snorlax","options":{"level":100}},"defender":{"species":"Raikou","options":{"level":100}},"move":{"name":"Double-Edge"},"field":{}}' \
             | python -m pokerena calc damage --stdin
