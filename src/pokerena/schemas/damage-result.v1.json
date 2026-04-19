@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pokerena Damage Calc Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generation",
+    "attacker",
+    "defender",
+    "move",
+    "damage",
+    "range",
+    "range_percent",
+    "description",
+    "knockout"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "pokerena.damage-result.v1"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "attacker": {
+      "$ref": "#/$defs/combatant"
+    },
+    "defender": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "species",
+        "level",
+        "hp"
+      ],
+      "properties": {
+        "species": {
+          "type": "string",
+          "minLength": 1
+        },
+        "level": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hp": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "move": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "damage": {
+      "$ref": "#/$defs/damageValue"
+    },
+    "range": {
+      "$ref": "#/$defs/range"
+    },
+    "range_percent": {
+      "$ref": "#/$defs/range"
+    },
+    "description": {
+      "type": "string"
+    },
+    "knockout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chance",
+        "hits",
+        "text"
+      ],
+      "properties": {
+        "chance": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "hits": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "combatant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "species",
+        "level"
+      ],
+      "properties": {
+        "species": {
+          "type": "string",
+          "minLength": 1
+        },
+        "level": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min",
+        "max"
+      ],
+      "properties": {
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        }
+      }
+    },
+    "damageValue": {
+      "oneOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/damageValue"
+          }
+        }
+      ]
+    }
+  }
+}

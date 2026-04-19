@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pokerena Damage Calc Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generation",
+    "attacker",
+    "defender",
+    "move"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "pokerena.damage-request.v1"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "attacker": {
+      "$ref": "#/$defs/pokemonRef"
+    },
+    "defender": {
+      "$ref": "#/$defs/pokemonRef"
+    },
+    "move": {
+      "$ref": "#/$defs/moveRef"
+    },
+    "field": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "pokemonRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "species"
+      ],
+      "properties": {
+        "species": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "type": "object"
+        }
+      }
+    },
+    "moveRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

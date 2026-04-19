@@ -1,0 +1,15 @@
+{
+  "name": "pokerena-agent-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node-based local tooling used by Pokerena agents.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "damage-calc": "node tools/damage-calc-cli.cjs"
+  },
+  "dependencies": {
+    "@smogon/calc": "0.11.0"
+  }
+}

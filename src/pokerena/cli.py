@@ -27,6 +27,15 @@ from .agent import (
     save_capture,
     save_cursor,
 )
+from .calc import (
+    CALC_DEPENDENCY_PATH,
+    CALC_SCRIPT_PATH,
+    DEFAULT_CALC_TIMEOUT_SECONDS,
+    detect_project_root,
+    read_damage_calc_input,
+    run_damage_calc,
+    sample_damage_calc_payload,
+)
 from .config import ConfigError, load_agents_config, load_server_config
 from .showdown import build_server_command, node_version, prepare_runtime
 
@@ -51,6 +60,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return run_render_config(args)
             if args.server_command == "up":
                 return run_up(args)
+        if args.command == "calc":
+            if args.calc_command == "damage":
+                return run_calc_damage(args)
         if args.command == "agent":
             if args.agent_command == "context":
                 return run_agent_context(args)
@@ -92,6 +104,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Render runtime files and print the launch command without starting the process.",
+    )
+
+    calc_parser = subparsers.add_parser("calc", help="Run local agent support tools.")
+    calc_subparsers = calc_parser.add_subparsers(dest="calc_command")
+
+    damage_parser = calc_subparsers.add_parser(
+        "damage",
+        help="Calculate damage using the local @smogon/calc wrapper.",
+    )
+    damage_input = damage_parser.add_mutually_exclusive_group(required=True)
+    damage_input.add_argument(
+        "--input",
+        help="Path to a JSON file describing one damage calculation request.",
+    )
+    damage_input.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the damage calculation request JSON from stdin.",
+    )
+    damage_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_CALC_TIMEOUT_SECONDS,
+        help="How long to wait for the local Node damage calc process before failing.",
     )
 
     agent_parser = subparsers.add_parser("agent", help="Manage the battle-agent runtime.")
@@ -253,7 +289,7 @@ def run_up(args: argparse.Namespace) -> int:
         return 0
 
     if shutil.which("node") is None:
-        print("error: node is required on PATH. Run scripts/bootstrap-showdown.sh first.", file=sys.stderr)
+        print("error: node is required on PATH. Run ./scripts/bootstrap-node-deps.sh first.", file=sys.stderr)
         return 1
 
     version = node_version()
@@ -262,7 +298,7 @@ def run_up(args: argparse.Namespace) -> int:
         return 1
 
     if shutil.which("npm") is None:
-        print("error: npm is required on PATH. Run scripts/bootstrap-showdown.sh first.", file=sys.stderr)
+        print("error: npm is required on PATH. Run ./scripts/bootstrap-node-deps.sh first.", file=sys.stderr)
         return 1
 
     launcher_path = server_config.showdown_path / "pokemon-showdown"
@@ -276,13 +312,28 @@ def run_up(args: argparse.Namespace) -> int:
     node_modules = server_config.showdown_path / "node_modules"
     if not node_modules.exists():
         print(
-            f"error: {node_modules} is missing. Run scripts/bootstrap-showdown.sh first.",
+            f"error: {node_modules} is missing. Run ./scripts/bootstrap-node-deps.sh first.",
             file=sys.stderr,
         )
         return 1
 
     completed = subprocess.run(command, cwd=server_config.showdown_path)
     return completed.returncode
+
+
+def run_calc_damage(args: argparse.Namespace) -> int:
+    project_root = detect_project_root()
+    payload = read_damage_calc_input(
+        input_path=args.input,
+        use_stdin=args.stdin,
+    )
+    result = run_damage_calc(
+        payload,
+        project_root=project_root,
+        timeout_seconds=args.timeout,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
 
 
 def run_agent_context(args: argparse.Namespace) -> int:
@@ -579,6 +630,52 @@ def collect_doctor_checks(
             name="npm",
             ok=npm_binary is not None,
             detail=npm_binary or "npm is not installed",
+        )
+    )
+
+    calc_script = project_root / CALC_SCRIPT_PATH
+    calc_dependency = project_root / CALC_DEPENDENCY_PATH
+    results.append(
+        CheckResult(
+            name="calc-script",
+            ok=calc_script.exists(),
+            detail=str(calc_script) if calc_script.exists() else f"missing {calc_script}",
+        )
+    )
+    results.append(
+        CheckResult(
+            name="calc-deps",
+            ok=calc_dependency.exists(),
+            detail=str(calc_dependency) if calc_dependency.exists() else f"missing {calc_dependency}",
+        )
+    )
+    if node_binary is None:
+        detail = "install Node.js 22+ and rerun ./scripts/bootstrap-node-deps.sh"
+        ok = False
+    elif not _is_supported_node_version(version):
+        detail = f"upgrade Node.js to 22+ (found {version})"
+        ok = False
+    elif not calc_script.exists() or not calc_dependency.exists():
+        detail = "install root node dependencies with ./scripts/bootstrap-node-deps.sh"
+        ok = False
+    else:
+        try:
+            smoke_result = run_damage_calc(
+                sample_damage_calc_payload(),
+                project_root=project_root,
+                timeout_seconds=DEFAULT_CALC_TIMEOUT_SECONDS,
+            )
+            calc_range = smoke_result.get("range", {})
+            detail = f"range {calc_range.get('min')}-{calc_range.get('max')}"
+            ok = True
+        except ConfigError as error:
+            detail = str(error)
+            ok = False
+    results.append(
+        CheckResult(
+            name="calc-smoke",
+            ok=ok,
+            detail=detail,
         )
     )
 
