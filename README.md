@@ -92,7 +92,93 @@ This mounts your local config files read-only and writes generated runtime state
 - `data_dir`
 - `log_dir`
 
-`config/agents.yaml` is reserved for future agent definitions. The first scaffold validates and surfaces these entries without launching them yet.
+`config/agents.yaml` now defines the first local battle-agent runtime. Each entry declares:
+
+- `provider`
+- `player_slot`
+- `transport`
+- `launch.command`
+- `launch.args`
+- `hook.type`
+- `hook.context_format`
+- `hook.decision_format`
+- `hook.prompt_style`
+
+## Agent Runtime
+
+Pokérena now uses an event-driven battle session core instead of parsing public battle logs. The first live adapter is the local Showdown simulator stream, which emits:
+
+- public battle updates
+- private per-player `|request|` payloads
+- battle end metadata
+
+That means the agent sees the same decision surface that Showdown itself uses. Pokérena owns the session state, retry counters, and recent public history, while legality is forwarded directly from the raw `request` payload instead of being recomputed.
+
+The stable turn context schema is `pokerena.turn-context.v1`. It includes:
+
+- `rqid` as the request identity when available, with a stable synthetic ID in local simulator mode
+- `signals.turn_started` as informational metadata
+- `signals.request_updated` and `signals.decision_required` as the operational decision signals
+- the raw Showdown `request` payload
+- recent public protocol lines
+- simple legal action hints derived from the request payload
+
+The decision schema is `pokerena.decision.v1`, which returns one Showdown choice string plus optional notes.
+
+### Live Simulator Flow
+
+Run a local simulator battle with the configured agent on one side and a built-in `first-legal` fallback opponent on the other:
+
+```bash
+python3.14 -m pokerena agent sim-battle \
+  --config config/server.local.yaml \
+  --agents-config config/agents.yaml \
+  --agent-id example-randbat-bot \
+  --format gen9randombattle
+```
+
+Use `--dry-run` to stop after the first turn context is rendered:
+
+```bash
+python3.14 -m pokerena agent sim-battle \
+  --config config/server.local.yaml \
+  --agents-config config/agents.yaml \
+  --agent-id example-randbat-bot \
+  --format gen9randombattle \
+  --dry-run
+```
+
+The live runtime applies a per-decision timeout and a max invalid-choice retry policy. If the agent times out or keeps returning illegal choices, Pokérena falls back to the built-in `first-legal` policy for that request so the battle can continue deterministically.
+
+### Replay And Debugging
+
+Pokérena writes normalized battle captures under `.runtime/agents/<agent-id>/<battle-id>/capture.json`. These captures contain both public updates and private side requests, so they can be replayed later without relying on incomplete public transcripts.
+
+To inspect the current turn context from a recorded capture:
+
+```bash
+python3.14 -m pokerena agent context \
+  --agent-id example-randbat-bot \
+  --agents-config config/agents.yaml \
+  --capture .runtime/agents/example-randbat-bot/<battle-id>/capture.json
+```
+
+To rebuild the same context and invoke the configured subprocess hook from a capture:
+
+```bash
+python3.14 -m pokerena agent decide \
+  --agent-id example-randbat-bot \
+  --agents-config config/agents.yaml \
+  --capture .runtime/agents/example-randbat-bot/<battle-id>/capture.json
+```
+
+The hook writes its exact turn context, prompt, response, and cursor state into `.runtime/agents/<agent-id>/<battle-id>/`.
+
+### Adapter Status
+
+- `sim-stream` is the first end-to-end adapter and is the default local development path.
+- `showdown-client` is defined as a future adapter shape, but it is not implemented yet.
+- Public main-server play is intentionally not enabled by default in this scaffold.
 
 ## Notes
 

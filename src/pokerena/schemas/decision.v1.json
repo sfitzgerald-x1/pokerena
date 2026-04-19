@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pokerena Decision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision",
+    "notes",
+    "raw_output"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "pokerena.decision.v1"
+    },
+    "decision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "notes": {
+      "type": "string"
+    },
+    "raw_output": {
+      "type": "string"
+    }
+  }
+}
