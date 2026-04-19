@@ -820,8 +820,24 @@ class BattleAgentRuntimeTest(unittest.TestCase):
 
         events = adapter._consume_message("|updateuser|too-short")
 
-        self.assertEqual(events, [])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "client_notice")
+        self.assertIn("malformed Showdown |updateuser|", events[0].payload["message"])
         self.assertFalse(adapter.authenticated)
+
+        duplicate_events = adapter._consume_message("|updateuser|too-short")
+        self.assertEqual(duplicate_events, [])
+
+    def test_showdown_client_adapter_emits_notice_for_malformed_updatechallenges(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+
+        events = adapter._consume_message("|updatechallenges|not-json")
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "client_notice")
+        self.assertIn("malformed Showdown |updatechallenges|", events[0].payload["message"])
 
     def test_showdown_client_adapter_forfeits_unexpected_second_battle_room(self) -> None:
         adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())

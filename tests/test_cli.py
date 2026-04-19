@@ -296,6 +296,192 @@ class CLITest(unittest.TestCase):
             self.assertTrue(viewer_process.terminated)
             self.assertTrue(restarted_agent.terminated)
 
+    def test_server_up_stops_restarting_callable_agent_after_restart_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "vendor" / "pokemon-showdown").mkdir(parents=True)
+            (root / "config" / "server.local.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    showdown_path: vendor/pokemon-showdown
+                    bind_address: 0.0.0.0
+                    port: 8000
+                    server_id: pokerena-local
+                    public_origin: http://localhost:8000
+                    no_security: true
+                    data_dir: .runtime/showdown/data
+                    log_dir: .runtime/showdown/logs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "config" / "agents.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    agents:
+                      - id: callable-agent
+                        enabled: true
+                        provider: claude
+                        player_slot: p1
+                        format_allowlist: [gen3randombattle]
+                        transport: showdown-client
+                        launch:
+                          command: cat
+                          args: []
+                          cwd: .
+                        callable:
+                          enabled: true
+                          username: ClaudeLocalBot
+                          accepted_formats: [gen3randombattle]
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "vendor" / "pokemon-showdown" / "pokemon-showdown").write_text("", encoding="utf-8")
+            (root / "vendor" / "pokemon-showdown" / "node_modules").mkdir()
+
+            server_process = _FakeProcess()
+            viewer_process = _FakeProcess()
+            crashed_agent_one = _FakeProcess(returncode=17)
+            crashed_agent_two = _FakeProcess(returncode=18)
+            monotonic_values = iter([0.0, 2.0, 4.0])
+            with (
+                mock.patch("pokerena.cli.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"),
+                mock.patch("pokerena.cli.node_version", return_value="v22.0.0"),
+                mock.patch("pokerena.cli._wait_for_server_ready"),
+                mock.patch("pokerena.cli._wait_for_http_ready"),
+                mock.patch("pokerena.cli.MAX_SUPERVISED_CHILD_RESTARTS", 2),
+                mock.patch("pokerena.cli.time.monotonic", side_effect=lambda: next(monotonic_values)),
+                mock.patch("pokerena.cli.time.sleep", side_effect=[None, None, KeyboardInterrupt]),
+                mock.patch(
+                    "pokerena.cli.subprocess.Popen",
+                    side_effect=[server_process, viewer_process, crashed_agent_one, crashed_agent_two],
+                ) as popen,
+                mock.patch("sys.stdout", new=StringIO()),
+                mock.patch("sys.stderr", new=StringIO()) as stderr_buffer,
+            ):
+                old_cwd = Path.cwd()
+                old_environ = dict(os.environ)
+                try:
+                    os.chdir(root)
+                    os.environ["ANTHROPIC_API_KEY"] = "test-secret"
+                    code = main(
+                        [
+                            "server",
+                            "up",
+                            "--config",
+                            "config/server.local.yaml",
+                            "--agents-config",
+                            "config/agents.yaml",
+                        ]
+                    )
+                finally:
+                    os.chdir(old_cwd)
+                    os.environ.clear()
+                    os.environ.update(old_environ)
+
+            self.assertEqual(code, 130)
+            self.assertEqual(popen.call_count, 4)
+            self.assertIn("reached the restart limit", stderr_buffer.getvalue())
+            self.assertTrue(server_process.terminated)
+            self.assertTrue(viewer_process.terminated)
+
+    def test_server_up_passes_provider_env_to_callable_children(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "vendor" / "pokemon-showdown").mkdir(parents=True)
+            (root / "config" / "server.local.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    showdown_path: vendor/pokemon-showdown
+                    bind_address: 0.0.0.0
+                    port: 8000
+                    server_id: pokerena-local
+                    public_origin: http://localhost:8000
+                    no_security: true
+                    data_dir: .runtime/showdown/data
+                    log_dir: .runtime/showdown/logs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "config" / "agents.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    agents:
+                      - id: callable-agent
+                        enabled: true
+                        provider: claude
+                        player_slot: p1
+                        format_allowlist: [gen3randombattle]
+                        transport: showdown-client
+                        launch:
+                          command: cat
+                          args: []
+                          cwd: .
+                        callable:
+                          enabled: true
+                          username: ClaudeLocalBot
+                          accepted_formats: [gen3randombattle]
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "vendor" / "pokemon-showdown" / "pokemon-showdown").write_text("", encoding="utf-8")
+            (root / "vendor" / "pokemon-showdown" / "node_modules").mkdir()
+
+            server_process = _FakeProcess()
+            viewer_process = _FakeProcess()
+            agent_process = _FakeProcess()
+            popen_envs: list[dict[str, str]] = []
+            spawned_processes = iter([server_process, viewer_process, agent_process])
+
+            def _fake_popen(*args, **kwargs):
+                env = kwargs.get("env")
+                if env is not None:
+                    popen_envs.append(dict(env))
+                return next(spawned_processes)
+
+            with (
+                mock.patch("pokerena.cli.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"),
+                mock.patch("pokerena.cli.node_version", return_value="v22.0.0"),
+                mock.patch("pokerena.cli._wait_for_server_ready"),
+                mock.patch("pokerena.cli._wait_for_http_ready"),
+                mock.patch("pokerena.cli.time.sleep", side_effect=KeyboardInterrupt),
+                mock.patch("pokerena.cli.subprocess.Popen", side_effect=_fake_popen),
+                mock.patch("sys.stdout", new=StringIO()),
+                mock.patch("sys.stderr", new=StringIO()),
+            ):
+                old_cwd = Path.cwd()
+                old_environ = dict(os.environ)
+                try:
+                    os.chdir(root)
+                    os.environ["ANTHROPIC_API_KEY"] = "test-secret"
+                    code = main(
+                        [
+                            "server",
+                            "up",
+                            "--config",
+                            "config/server.local.yaml",
+                            "--agents-config",
+                            "config/agents.yaml",
+                        ]
+                    )
+                finally:
+                    os.chdir(old_cwd)
+                    os.environ.clear()
+                    os.environ.update(old_environ)
+
+            self.assertEqual(code, 130)
+            self.assertEqual(len(popen_envs), 2)
+            self.assertEqual(popen_envs[1]["ANTHROPIC_API_KEY"], "test-secret")
+
     def test_doctor_reports_missing_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

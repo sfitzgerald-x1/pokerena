@@ -27,52 +27,12 @@ from .calc import (
     classify_move_support,
 )
 from .config import AgentDefinition, ConfigError, ServerConfig, _parse_dotenv
+from .runtime_env import filtered_runtime_env
 
 
 TURN_CONTEXT_SCHEMA_VERSION = "pokerena.turn-context.v1"
 DECISION_SCHEMA_VERSION = "pokerena.decision.v1"
 CAPTURE_SCHEMA_VERSION = "pokerena.battle-capture.v1"
-HOOK_ENV_ALLOWLIST = {
-    "HOME",
-    "PATH",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "TERM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "COLORTERM",
-    "NO_COLOR",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "REQUESTS_CA_BUNDLE",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-    "VIRTUAL_ENV",
-    "PYTHONPATH",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "CODEX_HOME",
-}
-HOOK_ENV_PREFIX_ALLOWLIST = (
-    "ANTHROPIC_",
-    "OPENAI_",
-    "AWS_",
-    "AZURE_OPENAI_",
-    "CLAUDE_",
-)
-
-
 @dataclass(frozen=True)
 class DecisionPolicy:
     max_invalid_retries: int = 3
@@ -518,6 +478,7 @@ class ShowdownClientAdapter:
         self.current_battle_id: Optional[str] = None
         self.pending_challenger: Optional[str] = None
         self.pending_format: Optional[str] = None
+        self._warned_malformed_frames: set[str] = set()
 
     def connect(self) -> None:
         if not self.agent.callable.enabled:
@@ -625,16 +586,22 @@ class ShowdownClientAdapter:
                 self._send_global(f"/trn {self.agent.callable.username}")
                 continue
             if line.startswith("|updateuser|"):
-                self._handle_updateuser(line)
+                warning = self._handle_updateuser(line)
+                if warning is not None:
+                    events.append(warning)
                 continue
             if line.startswith("|nametaken|"):
-                self._handle_nametaken(line)
+                warning = self._handle_nametaken(line)
+                if warning is not None:
+                    events.append(warning)
                 continue
             if line.startswith("|pm|"):
                 self._handle_pm(line)
                 continue
             if line.startswith("|updatechallenges|"):
-                self._handle_updatechallenges(line)
+                warning = self._handle_updatechallenges(line)
+                if warning is not None:
+                    events.append(warning)
                 continue
             if line.startswith("|popup|"):
                 events.append(
@@ -659,15 +626,18 @@ class ShowdownClientAdapter:
         if challenge_format:
             self._handle_incoming_challenge(sender, challenge_format)
 
-    def _handle_updateuser(self, line: str) -> None:
+    def _handle_updateuser(self, line: str) -> Optional[SessionEvent]:
         parts = line.split("|", 5)
         if len(parts) < 5:
-            return
+            return self._warn_malformed_frame_once(
+                "updateuser-short",
+                f"Ignored malformed Showdown |updateuser| frame: {line}",
+            )
         user = parts[2]
         named = parts[3] == "1"
         avatar = parts[4] if len(parts) > 4 else ""
         if _user_id(user) != _user_id(self.agent.callable.username or ""):
-            return
+            return None
         if not named:
             raise ConfigError(
                 f"Showdown reported {self.agent.callable.username!r} without a stable local rename."
@@ -675,28 +645,42 @@ class ShowdownClientAdapter:
         self.authenticated = True
         if self.agent.callable.avatar and avatar != self.agent.callable.avatar:
             self._send_global(f"/avatar {self.agent.callable.avatar}")
+        return None
 
-    def _handle_nametaken(self, line: str) -> None:
+    def _handle_nametaken(self, line: str) -> Optional[SessionEvent]:
         parts = line.split("|", 3)
         if len(parts) < 4:
-            return
+            return self._warn_malformed_frame_once(
+                "nametaken-short",
+                f"Ignored malformed Showdown |nametaken| frame: {line}",
+            )
         username = parts[2]
         message = parts[3]
         if _user_id(username) == _user_id(self.agent.callable.username or ""):
             raise ConfigError(
                 f"Callable bot username {self.agent.callable.username!r} is unavailable: {message}"
             )
+        return None
 
-    def _handle_updatechallenges(self, line: str) -> None:
+    def _handle_updatechallenges(self, line: str) -> Optional[SessionEvent]:
         try:
             payload = json.loads(line[len("|updatechallenges|") :])
         except json.JSONDecodeError:
-            return
+            return self._warn_malformed_frame_once(
+                "updatechallenges-json",
+                f"Ignored malformed Showdown |updatechallenges| frame: {line}",
+            )
         if not isinstance(payload, dict):
-            return
+            return self._warn_malformed_frame_once(
+                "updatechallenges-shape",
+                "Ignored malformed Showdown |updatechallenges| payload because it was not a JSON object.",
+            )
         challenges = payload.get("challengesFrom", {})
         if not isinstance(challenges, dict):
-            return
+            return self._warn_malformed_frame_once(
+                "updatechallenges-challengesFrom",
+                "Ignored malformed Showdown |updatechallenges| payload because challengesFrom was not an object.",
+            )
         if self.pending_challenger and self.pending_challenger not in challenges:
             self.pending_challenger = None
             self.pending_format = None
@@ -704,6 +688,7 @@ class ShowdownClientAdapter:
             if not isinstance(challenger, str) or not isinstance(challenge_format, str):
                 continue
             self._handle_incoming_challenge(challenger, challenge_format)
+        return None
 
     def _handle_incoming_challenge(self, challenger: str, challenge_format: str) -> None:
         if self.agent.callable.challenge_policy != "accept-direct-challenges":
@@ -730,6 +715,16 @@ class ShowdownClientAdapter:
     def _reject_challenge(self, challenger: str, message: str) -> None:
         self._send_global(f"/pm {challenger}, {message}")
         self._send_global(f"/reject {challenger}")
+
+    def _warn_malformed_frame_once(self, key: str, message: str) -> Optional[SessionEvent]:
+        if key in self._warned_malformed_frames:
+            return None
+        self._warned_malformed_frames.add(key)
+        return SessionEvent(
+            event_type="client_notice",
+            battle_id=self.current_battle_id or "global",
+            payload={"message": message},
+        )
 
     def _consume_battle_room(self, room_id: str, lines: List[str]) -> List[SessionEvent]:
         if self.current_battle_id and room_id != self.current_battle_id:
@@ -1333,7 +1328,7 @@ def invoke_agent(
     if dry_run:
         return None, artifacts
 
-    env = _hook_base_env()
+    env = filtered_runtime_env()
     if agent.env_file and agent.env_file.exists():
         env.update(_parse_dotenv(agent.env_file))
     env["POKERENA_TURN_CONTEXT_PATH"] = str(context_path)
@@ -2032,10 +2027,3 @@ def _user_id(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).lower()
     return "".join(character for character in normalized if character.isalnum())
 
-
-def _hook_base_env() -> Dict[str, str]:
-    env: Dict[str, str] = {}
-    for key, value in os.environ.items():
-        if key in HOOK_ENV_ALLOWLIST or any(key.startswith(prefix) for prefix in HOOK_ENV_PREFIX_ALLOWLIST):
-            env[key] = value
-    return env

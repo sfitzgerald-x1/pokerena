@@ -52,6 +52,7 @@ from .calc import (
     sample_damage_calc_payload,
 )
 from .config import ConfigError, load_agents_config, load_server_config
+from .runtime_env import filtered_runtime_env
 from .showdown import build_server_command, node_version, prepare_runtime
 from .transcript import (
     TranscriptEntry,
@@ -68,6 +69,9 @@ from .transcript import (
     upsert_battle_summary_entry,
 )
 from .transcript_viewer import serve_transcript_viewer, transcript_viewer_url
+
+
+MAX_SUPERVISED_CHILD_RESTARTS = 5
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,7 @@ class _SupervisedChild:
     threads: list[threading.Thread] = None  # type: ignore[assignment]
     restart_attempts: int = 0
     next_restart_at: float = 0.0
+    stopped_permanently: bool = False
 
     def __post_init__(self) -> None:
         if self.threads is None:
@@ -477,7 +482,7 @@ def run_up(args: argparse.Namespace) -> int:
             viewer_process = subprocess.Popen(
                 viewer_command,
                 cwd=project_root,
-                env=_supervisor_child_env({"PYTHONUNBUFFERED": "1"}),
+                env=filtered_runtime_env({"PYTHONUNBUFFERED": "1"}),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -504,7 +509,7 @@ def run_up(args: argparse.Namespace) -> int:
                 label=f"agent:{agent.agent_id}",
                 command=agent_command,
                 cwd=project_root,
-                env=_supervisor_child_env({"PYTHONUNBUFFERED": "1"}),
+                env=filtered_runtime_env({"PYTHONUNBUFFERED": "1"}),
             )
             _start_supervised_child(child)
             supervised_agents.append(child)
@@ -524,6 +529,8 @@ def run_up(args: argparse.Namespace) -> int:
             now = time.monotonic()
             for child in supervised_agents:
                 if child.process is None:
+                    if child.stopped_permanently:
+                        continue
                     if now >= child.next_restart_at:
                         _start_supervised_child(child)
                     continue
@@ -534,6 +541,14 @@ def run_up(args: argparse.Namespace) -> int:
                 child.threads = []
                 child.process = None
                 child.restart_attempts += 1
+                if child.restart_attempts >= MAX_SUPERVISED_CHILD_RESTARTS:
+                    child.stopped_permanently = True
+                    child.next_restart_at = float("inf")
+                    print(
+                        f"error: {child.label} exited unexpectedly with code {code} and reached the restart limit; leaving it stopped.",
+                        file=sys.stderr,
+                    )
+                    continue
                 backoff_seconds = min(30.0, float(2 ** min(child.restart_attempts - 1, 5)))
                 child.next_restart_at = now + backoff_seconds
                 print(
@@ -1667,43 +1682,6 @@ def _start_supervised_child(child: _SupervisedChild) -> None:
     child.process = process
     child.threads = _start_prefixed_log_threads(process, child.label)
     child.next_restart_at = 0.0
-
-
-def _supervisor_child_env(additional: Optional[dict[str, str]] = None) -> dict[str, str]:
-    allowlist = {
-        "HOME",
-        "PATH",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "TERM",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "no_proxy",
-        "VIRTUAL_ENV",
-        "PYTHONPATH",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "CODEX_HOME",
-    }
-    env = {key: value for key, value in os.environ.items() if key in allowlist}
-    if additional:
-        env.update(additional)
-    return env
 
 
 def _start_log_thread(source: IO[str], target: IO[str], label: str) -> threading.Thread:
