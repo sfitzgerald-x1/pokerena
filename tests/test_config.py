@@ -118,6 +118,35 @@ class ConfigLoadingTest(unittest.TestCase):
             self.assertTrue(config.transcript_viewer.enabled)
             self.assertEqual(config.transcript_viewer.port, 8123)
 
+    def test_load_server_config_rejects_non_loopback_transcript_viewer_bind_address(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "vendor" / "pokemon-showdown").mkdir(parents=True)
+            (root / "config" / "server.local.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    showdown_path: vendor/pokemon-showdown
+                    bind_address: 127.0.0.1
+                    port: 8000
+                    server_id: pokerena-local
+                    public_origin: http://localhost:8000
+                    no_security: true
+                    data_dir: .runtime/showdown/data
+                    log_dir: .runtime/showdown/logs
+                    transcript_viewer:
+                      enabled: true
+                      bind_address: 0.0.0.0
+                      port: 8123
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "loopback"):
+                load_server_config(project_root=root)
+
     def test_load_agents_config_accepts_hook_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

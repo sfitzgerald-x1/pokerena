@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+import ipaddress
 from pathlib import Path
 import os
 from typing import Dict, List, Optional
@@ -141,10 +142,13 @@ def load_server_config(
         raise ConfigError("config.transcript_viewer must be a mapping.")
     transcript_viewer = TranscriptViewerConfig(
         enabled=_parse_bool(_nested_value(values, "transcript_viewer.enabled", transcript_viewer_raw.get("enabled", True))),
-        bind_address=_required_string(
-            {"bind_address": _nested_value(values, "transcript_viewer.bind_address", transcript_viewer_raw.get("bind_address", "127.0.0.1"))},
-            "bind_address",
-            prefix="config.transcript_viewer",
+        bind_address=_require_loopback_bind_address(
+            _required_string(
+                {"bind_address": _nested_value(values, "transcript_viewer.bind_address", transcript_viewer_raw.get("bind_address", "127.0.0.1"))},
+                "bind_address",
+                prefix="config.transcript_viewer",
+            ),
+            key="config.transcript_viewer.bind_address",
         ),
         port=_parse_port(_nested_value(values, "transcript_viewer.port", transcript_viewer_raw.get("port", 8001))),
     )
@@ -287,6 +291,10 @@ def load_agents_config(
             avatar = _optional_string(avatar_value, default="")
             if not avatar:
                 raise ConfigError(f"agents[{index}].callable.avatar must be a non-empty string if set.")
+            if not _is_safe_showdown_avatar(avatar):
+                raise ConfigError(
+                    f"agents[{index}].callable.avatar must contain only letters, numbers, underscores, or hyphens."
+                )
 
         pricing_block = raw_agent.get("pricing", {})
         if pricing_block is None:
@@ -488,6 +496,29 @@ def _parse_optional_non_negative_decimal(value: object, *, key: str) -> Optional
     if parsed < 0:
         raise ConfigError(f"{key} must be a non-negative number.")
     return parsed
+
+
+def _require_loopback_bind_address(value: str, *, key: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ConfigError(f"{key} must be a non-empty string.")
+    if normalized.lower() == "localhost":
+        return normalized
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError as error:
+        raise ConfigError(
+            f"{key} must stay on a loopback address such as 127.0.0.1, localhost, or ::1."
+        ) from error
+    if not address.is_loopback:
+        raise ConfigError(
+            f"{key} must stay on a loopback address such as 127.0.0.1, localhost, or ::1."
+        )
+    return normalized
+
+
+def _is_safe_showdown_avatar(value: str) -> bool:
+    return all(character.isalnum() or character in {"_", "-"} for character in value)
 
 
 def _nested_value(values: Dict[str, object], key: str, default: object) -> object:

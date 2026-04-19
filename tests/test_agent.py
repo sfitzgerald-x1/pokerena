@@ -813,6 +813,38 @@ class BattleAgentRuntimeTest(unittest.TestCase):
         adapter.submit_decision(player_slot="p1", choice="move 1", rqid="7")
         self.assertEqual(fake_connection.sent, ["battle-gen3randombattle-1|/choose move 1|7"])
 
+    def test_showdown_client_adapter_ignores_malformed_updateuser_frames(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+
+        events = adapter._consume_message("|updateuser|too-short")
+
+        self.assertEqual(events, [])
+        self.assertFalse(adapter.authenticated)
+
+    def test_showdown_client_adapter_forfeits_unexpected_second_battle_room(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+        adapter.authenticated = True
+        adapter.current_battle_id = "battle-gen3randombattle-1"
+
+        events = adapter._consume_message(
+            textwrap.dedent(
+                """
+                >battle-gen3randombattle-2
+                |init|battle
+                |title|ClaudeLocalBot vs. human-two
+                """
+            ).strip()
+        )
+
+        self.assertEqual(fake_connection.sent, ["battle-gen3randombattle-2|/forfeit"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "client_notice")
+        self.assertIn("only support one active battle", events[0].payload["message"])
+
     def test_hook_process_can_be_cancelled(self) -> None:
         with self.assertRaises(AgentCancelledError) as error:
             _run_hook_process(

@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional, Protocol
+import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 from jsonschema import Draft202012Validator
@@ -31,6 +32,45 @@ from .config import AgentDefinition, ConfigError, ServerConfig, _parse_dotenv
 TURN_CONTEXT_SCHEMA_VERSION = "pokerena.turn-context.v1"
 DECISION_SCHEMA_VERSION = "pokerena.decision.v1"
 CAPTURE_SCHEMA_VERSION = "pokerena.battle-capture.v1"
+HOOK_ENV_ALLOWLIST = {
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "COLORTERM",
+    "NO_COLOR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "CODEX_HOME",
+}
+HOOK_ENV_PREFIX_ALLOWLIST = (
+    "ANTHROPIC_",
+    "OPENAI_",
+    "AWS_",
+    "AZURE_OPENAI_",
+    "CLAUDE_",
+)
 
 
 @dataclass(frozen=True)
@@ -622,7 +662,7 @@ class ShowdownClientAdapter:
     def _handle_updateuser(self, line: str) -> None:
         parts = line.split("|", 5)
         if len(parts) < 5:
-            raise ConfigError(f"Malformed updateuser line from Showdown: {line}")
+            return
         user = parts[2]
         named = parts[3] == "1"
         avatar = parts[4] if len(parts) > 4 else ""
@@ -639,7 +679,7 @@ class ShowdownClientAdapter:
     def _handle_nametaken(self, line: str) -> None:
         parts = line.split("|", 3)
         if len(parts) < 4:
-            raise ConfigError(f"Malformed nametaken line from Showdown: {line}")
+            return
         username = parts[2]
         message = parts[3]
         if _user_id(username) == _user_id(self.agent.callable.username or ""):
@@ -648,9 +688,12 @@ class ShowdownClientAdapter:
             )
 
     def _handle_updatechallenges(self, line: str) -> None:
-        payload = json.loads(line[len("|updatechallenges|") :])
+        try:
+            payload = json.loads(line[len("|updatechallenges|") :])
+        except json.JSONDecodeError:
+            return
         if not isinstance(payload, dict):
-            raise ConfigError("Showdown updatechallenges payload must be a JSON object.")
+            return
         challenges = payload.get("challengesFrom", {})
         if not isinstance(challenges, dict):
             return
@@ -663,6 +706,9 @@ class ShowdownClientAdapter:
             self._handle_incoming_challenge(challenger, challenge_format)
 
     def _handle_incoming_challenge(self, challenger: str, challenge_format: str) -> None:
+        if self.agent.callable.challenge_policy != "accept-direct-challenges":
+            self._reject_challenge(challenger, "This bot is not accepting challenges right now.")
+            return
         normalized_format = challenge_format.strip().lower()
         accepted_formats = {item.lower() for item in self.agent.callable.accepted_formats}
         if self.current_battle_id is not None or (
@@ -687,9 +733,18 @@ class ShowdownClientAdapter:
 
     def _consume_battle_room(self, room_id: str, lines: List[str]) -> List[SessionEvent]:
         if self.current_battle_id and room_id != self.current_battle_id:
-            raise ConfigError(
-                f"Callable local agents only support one active battle at a time. Saw {room_id} while {self.current_battle_id} is active."
-            )
+            self._send(room_id, "/forfeit")
+            return [
+                SessionEvent(
+                    event_type="client_notice",
+                    battle_id=room_id,
+                    payload={
+                        "message": (
+                            "Forfeited an unexpected second battle room because callable local agents only support one active battle at a time."
+                        )
+                    },
+                )
+            ]
 
         events: List[SessionEvent] = []
         if self.current_battle_id != room_id:
@@ -1278,7 +1333,7 @@ def invoke_agent(
     if dry_run:
         return None, artifacts
 
-    env = os.environ.copy()
+    env = _hook_base_env()
     if agent.env_file and agent.env_file.exists():
         env.update(_parse_dotenv(agent.env_file))
     env["POKERENA_TURN_CONTEXT_PATH"] = str(context_path)
@@ -1974,4 +2029,13 @@ def _split_protocol_message(payload: str) -> List[tuple[Optional[str], List[str]
 
 
 def _user_id(value: str) -> str:
-    return "".join(character for character in value.lower() if character.isalnum())
+    normalized = unicodedata.normalize("NFKC", value).lower()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _hook_base_env() -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in HOOK_ENV_ALLOWLIST or any(key.startswith(prefix) for prefix in HOOK_ENV_PREFIX_ALLOWLIST):
+            env[key] = value
+    return env

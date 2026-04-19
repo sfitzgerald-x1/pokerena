@@ -19,15 +19,13 @@ from .transcript import (
 
 
 def transcript_viewer_url(server_config: ServerConfig) -> str:
-    host = server_config.transcript_viewer.bind_address
-    if host in {"0.0.0.0", ""}:
-        host = "127.0.0.1"
+    host = _format_http_host(server_config.transcript_viewer.bind_address)
     return f"http://{host}:{server_config.transcript_viewer.port}"
 
 
 def serve_transcript_viewer(server_config: ServerConfig) -> None:
     runtime_root = server_config.project_root / ".runtime"
-    handler = _build_handler(runtime_root)
+    handler = _build_handler(runtime_root, allowed_origin=transcript_viewer_url(server_config))
     httpd = ThreadingHTTPServer(
         (server_config.transcript_viewer.bind_address, server_config.transcript_viewer.port),
         handler,
@@ -38,7 +36,7 @@ def serve_transcript_viewer(server_config: ServerConfig) -> None:
         httpd.server_close()
 
 
-def _build_handler(runtime_root: Path):
+def _build_handler(runtime_root: Path, allowed_origin: Optional[str] = None):
     class TranscriptViewerHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if self.path in {"/", "/index.html"}:
@@ -60,6 +58,9 @@ def _build_handler(runtime_root: Path):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found.")
 
         def do_DELETE(self) -> None:  # noqa: N802
+            if not self._origin_allowed():
+                self.send_error(HTTPStatus.FORBIDDEN, "Origin not allowed.")
+                return
             identifiers = self._battle_identifiers()
             if identifiers is None:
                 self.send_error(HTTPStatus.NOT_FOUND, "Battle transcript not found.")
@@ -76,6 +77,9 @@ def _build_handler(runtime_root: Path):
             self._send_json({"ok": True, "agent_id": agent_id, "battle_id": battle_id})
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._origin_allowed():
+                self.send_error(HTTPStatus.FORBIDDEN, "Origin not allowed.")
+                return
             identifiers = self._battle_identifiers(action="stop")
             if identifiers is None:
                 self.send_error(HTTPStatus.NOT_FOUND, "Battle transcript not found.")
@@ -100,6 +104,14 @@ def _build_handler(runtime_root: Path):
 
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             return
+
+        def _origin_allowed(self) -> bool:
+            if not allowed_origin:
+                return True
+            origin = self.headers.get("Origin")
+            if not origin:
+                return True
+            return origin == allowed_origin
 
         def _battle_identifiers(self, *, action: Optional[str] = None) -> Optional[tuple[str, str]]:
             parts = [unquote(part) for part in self.path.split("/")[3:] if part]
@@ -136,6 +148,12 @@ def _build_handler(runtime_root: Path):
             self.wfile.write(body)
 
     return TranscriptViewerHandler
+
+
+def _format_http_host(host: str) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 _INDEX_HTML = """<!doctype html>

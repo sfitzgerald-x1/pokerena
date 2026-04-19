@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from send2trash import send2trash
@@ -564,7 +566,7 @@ def _read_payload(path: Path) -> Dict[str, Any]:
 
 def _write_payload(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_json(path, payload)
 
 
 def _default_actor_kind(kind: str) -> str:
@@ -663,7 +665,22 @@ def _read_control_payload(path: Path) -> Optional[Dict[str, Any]]:
 
 def _write_control_payload(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_json(path, payload)
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        handle.write(json.dumps(payload, indent=2) + "\n")
+        temp_path = Path(handle.name)
+    os.replace(temp_path, path)
 
 
 def _timestamp() -> str:

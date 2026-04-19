@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib import resources
 import json
@@ -36,7 +37,13 @@ CALC_SUPPORT_SUPPORTED_NON_DAMAGING = "supported_non_damaging"
 CALC_SUPPORT_UNSUPPORTED = "unsupported"
 DEFAULT_CALC_TIMEOUT_SECONDS = 15
 DEFAULT_CALC_WORKER_STARTUP_SECONDS = 5.0
+MAX_CALC_WORKER_LOG_BYTES = 1_000_000
 _CALC_WORKER_PROCESSES: Dict[Path, subprocess.Popen[str]] = {}
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 
 def read_damage_calc_input(
@@ -578,41 +585,44 @@ def _ensure_calc_worker(project_root: Path, *, timeout_seconds: float) -> Path:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     socket_path = runtime_dir / "worker.sock"
     log_path = runtime_dir / "worker.log"
+    lock_path = runtime_dir / "worker.lock"
 
-    existing_process = _CALC_WORKER_PROCESSES.get(socket_path)
-    if existing_process is not None:
-        if existing_process.poll() is None and _ping_worker(socket_path):
-            return socket_path
-        _CALC_WORKER_PROCESSES.pop(socket_path, None)
-
-    if _ping_worker(socket_path):
-        return socket_path
-    if socket_path.exists():
-        socket_path.unlink()
-
-    with log_path.open("a", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            ["node", str(project_root / CALC_WORKER_SCRIPT_PATH), "--socket", str(socket_path)],
-            cwd=project_root,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=log_file,
-            start_new_session=True,
-        )
-        _CALC_WORKER_PROCESSES[socket_path] = process
-
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
+    with _calc_worker_start_lock(lock_path):
+        existing_process = _CALC_WORKER_PROCESSES.get(socket_path)
+        if existing_process is not None:
+            if existing_process.poll() is None and _ping_worker(socket_path):
+                return socket_path
             _CALC_WORKER_PROCESSES.pop(socket_path, None)
-            raise ConfigError(
-                f"Damage calc worker exited before startup completed (code {process.returncode})."
-            )
+
         if _ping_worker(socket_path):
             return socket_path
-        time.sleep(0.05)
-    _CALC_WORKER_PROCESSES.pop(socket_path, None)
-    raise ConfigError(f"Timed out waiting for the damage calc worker at {socket_path}.")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        _rotate_worker_log_if_needed(log_path)
+        with log_path.open("a", encoding="utf-8") as log_file:
+            process = subprocess.Popen(
+                ["node", str(project_root / CALC_WORKER_SCRIPT_PATH), "--socket", str(socket_path)],
+                cwd=project_root,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=log_file,
+                start_new_session=True,
+            )
+            _CALC_WORKER_PROCESSES[socket_path] = process
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                _CALC_WORKER_PROCESSES.pop(socket_path, None)
+                raise ConfigError(
+                    f"Damage calc worker exited before startup completed (code {process.returncode})."
+                )
+            if _ping_worker(socket_path):
+                return socket_path
+            time.sleep(0.05)
+        _CALC_WORKER_PROCESSES.pop(socket_path, None)
+        raise ConfigError(f"Timed out waiting for the damage calc worker at {socket_path}.")
 
 
 def _ping_worker(socket_path: Path) -> bool:
@@ -649,15 +659,18 @@ def _send_worker_request(
 ) -> Dict[str, Any]:
     if not socket_path.exists():
         raise OSError(f"Worker socket does not exist: {socket_path}")
+    deadline = time.monotonic() + float(timeout_seconds)
     message = json.dumps(payload) + "\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(float(timeout_seconds))
+        client.settimeout(_remaining_timeout(deadline))
         client.connect(str(socket_path))
+        client.settimeout(_remaining_timeout(deadline))
         client.sendall(message.encode("utf-8"))
         client.shutdown(socket.SHUT_WR)
         chunks: List[bytes] = []
         while True:
             try:
+                client.settimeout(_remaining_timeout(deadline))
                 chunk = client.recv(65536)
             except socket.timeout as error:
                 raise TimeoutError("Timed out waiting for calc worker response.") from error
@@ -670,6 +683,37 @@ def _send_worker_request(
     if not raw:
         raise ValueError("Damage calc worker returned no output.")
     return json.loads(raw)
+
+
+@contextmanager
+def _calc_worker_start_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _rotate_worker_log_if_needed(log_path: Path) -> None:
+    try:
+        if log_path.exists() and log_path.stat().st_size >= MAX_CALC_WORKER_LOG_BYTES:
+            rotated_path = log_path.with_suffix(".log.1")
+            if rotated_path.exists():
+                rotated_path.unlink()
+            log_path.replace(rotated_path)
+    except OSError:
+        return
+
+
+def _remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Timed out waiting for calc worker response.")
+    return remaining
 
 
 def _read_json_input(

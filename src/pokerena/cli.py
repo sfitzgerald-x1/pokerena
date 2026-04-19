@@ -78,6 +78,22 @@ class CheckResult:
     required: bool = True
 
 
+@dataclass
+class _SupervisedChild:
+    label: str
+    command: list[str]
+    cwd: Path
+    env: dict[str, str]
+    process: Optional[subprocess.Popen[str]] = None
+    threads: list[threading.Thread] = None  # type: ignore[assignment]
+    restart_attempts: int = 0
+    next_restart_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.threads is None:
+            self.threads = []
+
+
 class ManualBattleStopRequested(ConfigError):
     """Raised when a live battle is manually stopped from the viewer."""
 
@@ -444,7 +460,7 @@ def run_up(args: argparse.Namespace) -> int:
     server_log_threads = _start_prefixed_log_threads(server_process, "server")
     viewer_process: Optional[subprocess.Popen[str]] = None
     viewer_log_threads: list[threading.Thread] = []
-    agent_processes: list[tuple[str, subprocess.Popen[str], list[threading.Thread]]] = []
+    supervised_agents: list[_SupervisedChild] = []
 
     try:
         _wait_for_server_ready(server_config, server_process)
@@ -461,7 +477,7 @@ def run_up(args: argparse.Namespace) -> int:
             viewer_process = subprocess.Popen(
                 viewer_command,
                 cwd=project_root,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=_supervisor_child_env({"PYTHONUNBUFFERED": "1"}),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -484,18 +500,14 @@ def run_up(args: argparse.Namespace) -> int:
                 "--agent-id",
                 agent.agent_id,
             ]
-            process = subprocess.Popen(
-                agent_command,
+            child = _SupervisedChild(
+                label=f"agent:{agent.agent_id}",
+                command=agent_command,
                 cwd=project_root,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                env=_supervisor_child_env({"PYTHONUNBUFFERED": "1"}),
             )
-            agent_processes.append(
-                (agent.agent_id, process, _start_prefixed_log_threads(process, f"agent:{agent.agent_id}"))
-            )
+            _start_supervised_child(child)
+            supervised_agents.append(child)
 
         while True:
             server_code = server_process.poll()
@@ -509,22 +521,34 @@ def run_up(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                     return viewer_code or 1
-            for agent_id, process, _ in agent_processes:
-                code = process.poll()
-                if code is not None:
-                    print(
-                        f"error: callable agent {agent_id!r} exited unexpectedly with code {code}.",
-                        file=sys.stderr,
-                    )
-                    return code or 1
+            now = time.monotonic()
+            for child in supervised_agents:
+                if child.process is None:
+                    if now >= child.next_restart_at:
+                        _start_supervised_child(child)
+                    continue
+                code = child.process.poll()
+                if code is None:
+                    continue
+                _join_threads(child.threads)
+                child.threads = []
+                child.process = None
+                child.restart_attempts += 1
+                backoff_seconds = min(30.0, float(2 ** min(child.restart_attempts - 1, 5)))
+                child.next_restart_at = now + backoff_seconds
+                print(
+                    f"warning: {child.label} exited unexpectedly with code {code}; restarting in {backoff_seconds:.1f}s.",
+                    file=sys.stderr,
+                )
             time.sleep(0.2)
     except KeyboardInterrupt:
         print("Shutting down Pokerena local server...")
         return 130
     finally:
-        for _, process, threads in agent_processes:
-            _terminate_process(process)
-            _join_threads(threads)
+        for child in supervised_agents:
+            if child.process is not None:
+                _terminate_process(child.process)
+            _join_threads(child.threads)
         if viewer_process is not None:
             _terminate_process(viewer_process)
             _join_threads(viewer_log_threads)
@@ -1628,6 +1652,58 @@ def _start_prefixed_log_threads(
     if process.stderr is not None:
         threads.append(_start_log_thread(process.stderr, sys.stderr, label))
     return threads
+
+
+def _start_supervised_child(child: _SupervisedChild) -> None:
+    process = subprocess.Popen(
+        child.command,
+        cwd=child.cwd,
+        env=child.env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    child.process = process
+    child.threads = _start_prefixed_log_threads(process, child.label)
+    child.next_restart_at = 0.0
+
+
+def _supervisor_child_env(additional: Optional[dict[str, str]] = None) -> dict[str, str]:
+    allowlist = {
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "VIRTUAL_ENV",
+        "PYTHONPATH",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CODEX_HOME",
+    }
+    env = {key: value for key, value in os.environ.items() if key in allowlist}
+    if additional:
+        env.update(additional)
+    return env
 
 
 def _start_log_thread(source: IO[str], target: IO[str], label: str) -> threading.Thread:

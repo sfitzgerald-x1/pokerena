@@ -2,6 +2,7 @@ import json
 import os
 from io import StringIO
 from pathlib import Path
+import socket
 import subprocess
 import shutil
 import tempfile
@@ -12,6 +13,7 @@ from unittest import mock
 from pokerena.calc import (
     CALC_BATCH_REQUEST_SCHEMA_VERSION,
     CALC_REQUEST_SCHEMA_VERSION,
+    _send_worker_request,
     detect_project_root,
     read_damage_calc_batch_input,
     read_damage_calc_input,
@@ -87,6 +89,45 @@ class DamageCalcTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ConfigError, "timed out"):
                     run_damage_calc(sample_damage_calc_payload(), project_root=root, timeout_seconds=1)
+
+    def test_send_worker_request_enforces_hard_deadline_after_partial_response(self) -> None:
+        class _FakeSocket:
+            def __init__(self, *args, **kwargs) -> None:
+                self.recv_calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def settimeout(self, value) -> None:
+                self.timeout = value
+
+            def connect(self, path) -> None:
+                self.path = path
+
+            def sendall(self, message) -> None:
+                self.message = message
+
+            def shutdown(self, how) -> None:
+                self.how = how
+
+            def recv(self, size) -> bytes:
+                self.recv_calls += 1
+                if self.recv_calls == 1:
+                    return b"{"
+                raise socket.timeout("still waiting")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "worker.sock"
+            socket_path.write_text("", encoding="utf-8")
+            with (
+                mock.patch("pokerena.calc.socket.socket", _FakeSocket),
+                mock.patch("pokerena.calc.time.monotonic", side_effect=[0.0, 0.0, 0.1, 0.2, 1.5]),
+            ):
+                with self.assertRaisesRegex(TimeoutError, "Timed out waiting for calc worker response"):
+                    _send_worker_request(socket_path, {"command": "ping"}, timeout_seconds=1)
 
     def test_calc_damage_command_reads_file_input_from_nested_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
