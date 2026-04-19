@@ -1,6 +1,7 @@
 .env
 .runtime/
 .venv/
+node_modules/
 *.egg-info/
 __pycache__/
 .coverage
@@ -8,4 +9,3 @@ __pycache__/
 .pytest_cache/
 config/agents.yaml
 config/server.local.yaml
-

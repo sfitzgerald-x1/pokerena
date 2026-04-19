@@ -19,10 +19,8 @@ COPY . .
 
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir . \
-    && cd vendor/pokemon-showdown \
-    && npm ci
+    && ./scripts/bootstrap-node-deps.sh
 
 EXPOSE 8000
 
 CMD ["python", "-m", "pokerena", "server", "up", "--config", "config/server.local.yaml"]
-

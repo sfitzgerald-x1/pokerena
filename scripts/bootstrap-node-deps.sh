@@ -22,8 +22,16 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-git -C "${ROOT_DIR}" submodule update --init --recursive vendor/pokemon-showdown
+if [[ ! -f "${SHOWDOWN_DIR}/pokemon-showdown" ]]; then
+  if command -v git >/dev/null 2>&1 && [[ -d "${ROOT_DIR}/.git" ]]; then
+    git -C "${ROOT_DIR}" submodule update --init --recursive vendor/pokemon-showdown
+  else
+    echo "Pokemon Showdown checkout is missing from ${SHOWDOWN_DIR}. Initialize the submodule first." >&2
+    exit 1
+  fi
+fi
+
+npm --prefix "${ROOT_DIR}" ci
 npm --prefix "${SHOWDOWN_DIR}" ci
 
-echo "Pokemon Showdown is bootstrapped in ${SHOWDOWN_DIR}."
-
+echo "Pokerena node dependencies are bootstrapped in ${ROOT_DIR}."

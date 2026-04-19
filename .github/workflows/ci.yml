@@ -23,8 +23,8 @@ jobs:
       - name: Install Python package
         run: python -m pip install --upgrade pip && python -m pip install .
 
-      - name: Install Showdown dependencies
-        run: ./scripts/bootstrap-showdown.sh
+      - name: Install Node dependencies
+        run: ./scripts/bootstrap-node-deps.sh
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
@@ -32,3 +32,7 @@ jobs:
       - name: Render generated config
         run: python -m pokerena server render-config --config config/server.local.example.yaml
 
+      - name: Smoke test damage calc
+        run: |
+          printf '%s\n' '{"generation":2,"attacker":{"species":"Snorlax","options":{"level":100}},"defender":{"species":"Raikou","options":{"level":100}},"move":{"name":"Double-Edge"},"field":{}}' \
+            | python -m pokerena calc damage --stdin

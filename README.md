@@ -5,6 +5,7 @@ Pokérena is a Python-led harness for running a local Pokemon Showdown server th
 ## What This PR Sets Up
 
 - A pinned Pokemon Showdown submodule under `vendor/pokemon-showdown`
+- A repo-owned damage calc wrapper built on the official `@smogon/calc` package
 - A Python 3.14 CLI for environment checks, generated config rendering, and server startup
 - YAML config files for local server settings and future agent definitions
 - Host-run and Docker startup paths that use the same Pokerena config
@@ -21,7 +22,7 @@ Pokérena is a Python-led harness for running a local Pokemon Showdown server th
 1. Initialize the upstream Showdown checkout and install its dependencies:
 
    ```bash
-   ./scripts/bootstrap-showdown.sh
+   ./scripts/bootstrap-node-deps.sh
    ```
 
 2. Copy the example configs into local working files:
@@ -104,6 +105,58 @@ This mounts your local config files read-only and writes generated runtime state
 - `hook.decision_format`
 - `hook.prompt_style`
 
+## Damage Calc Wrapper
+
+Pokérena exposes damage calculation through its own CLI instead of asking agents to call Node directly. The wrapper delegates to the official `@smogon/calc` package locally and returns stable JSON.
+
+Use a JSON file:
+
+```bash
+python3.14 -m pokerena calc damage --input damage-request.json
+```
+
+Or pipe the request on stdin:
+
+```bash
+cat damage-request.json | python3.14 -m pokerena calc damage --stdin
+```
+
+The input shape is intentionally narrow for v1:
+
+```json
+{
+  "generation": 2,
+  "attacker": {
+    "species": "Snorlax",
+    "options": {
+      "level": 100,
+      "item": "Leftovers"
+    }
+  },
+  "defender": {
+    "species": "Raikou",
+    "options": {
+      "level": 100,
+      "item": "Leftovers"
+    }
+  },
+  "move": {
+    "name": "Double-Edge"
+  },
+  "field": {}
+}
+```
+
+The wrapper returns JSON with:
+
+- `damage`
+- `range`
+- `range_percent`
+- `description`
+- `knockout`
+
+Agents should call `python3.14 -m pokerena calc damage`, not `node`, so the command surface stays stable even if the underlying Node implementation changes later.
+
 ## Agent Runtime
 
 Pokérena now uses an event-driven battle session core instead of parsing public battle logs. The first live adapter is the local Showdown simulator stream, which emits:
@@ -183,5 +236,5 @@ The hook writes its exact turn context, prompt, response, and cursor state into 
 ## Notes
 
 - Pokerena targets Python 3.14 for future multithreaded orchestration work.
-- Pokemon Showdown itself still requires Node.js 22+ and npm.
+- Pokemon Showdown and the local calc wrapper both require Node.js 22+ and npm.
 - Generated runtime files live under `.runtime/showdown/`.
