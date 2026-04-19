@@ -286,13 +286,13 @@ def run_up(args: argparse.Namespace) -> int:
 
 
 def run_agent_context(args: argparse.Namespace) -> int:
-    context, _, _ = _load_replay_context(args)
+    context, _, _, _ = _load_replay_context(args)
     print(json.dumps(asdict(context), indent=2))
     return 0
 
 
 def run_agent_decide(args: argparse.Namespace) -> int:
-    context, agent, cursor_path = _load_replay_context(args)
+    context, agent, session, cursor_path = _load_replay_context(args)
     runtime_root = Path.cwd() / ".runtime"
     capture_path = Path(args.capture).resolve()
     decision, artifacts = invoke_agent(
@@ -317,13 +317,7 @@ def run_agent_decide(args: argparse.Namespace) -> int:
     if decision is None:
         raise ConfigError("Agent invocation did not return a decision.")
 
-    save_cursor(
-        cursor_path,
-        AgentContextCursor(
-            last_turn_number=context.turn_number,
-            last_request_sequence=context.request_sequence,
-        ),
-    )
+    save_cursor(cursor_path, session.advance_cursor())
     print(f"Response: {artifacts.response_path}")
     print(json.dumps(asdict(decision), indent=2))
     return 0
@@ -333,6 +327,8 @@ def run_agent_sim_battle(args: argparse.Namespace) -> int:
     server_config = load_server_config(config_path=args.config, project_root=Path.cwd())
     agents = load_agents_config(config_path=args.agents_config, project_root=Path.cwd())
     agent = find_agent(agents, args.agent_id)
+    if not agent.enabled:
+        raise ConfigError(f"Agent {agent.agent_id!r} is disabled in the agents config.")
     if agent.transport != "sim-stream":
         raise ConfigError(
             f"Agent {agent.agent_id!r} uses transport {agent.transport!r}. The live runtime currently supports sim-stream only."
@@ -457,7 +453,7 @@ def _load_replay_context(args: argparse.Namespace):
     )
     cursor = load_cursor(cursor_path)
     context = session.build_turn_context(agent=agent, cursor=cursor)
-    return context, agent, cursor_path
+    return context, agent, session, cursor_path
 
 
 def _decide_or_fallback(
@@ -510,6 +506,11 @@ def _submit_choice(
 
 def _resolve_format_id(agent, explicit_format: Optional[str]) -> str:
     if explicit_format:
+        if agent.format_allowlist and explicit_format not in agent.format_allowlist:
+            allowed = ", ".join(agent.format_allowlist)
+            raise ConfigError(
+                f"Format {explicit_format!r} is not allowed for agent {agent.agent_id!r}. Allowed formats: {allowed}."
+            )
         return explicit_format
     if agent.format_allowlist:
         return agent.format_allowlist[0]

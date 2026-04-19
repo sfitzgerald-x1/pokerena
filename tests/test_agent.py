@@ -169,6 +169,58 @@ class BattleAgentRuntimeTest(unittest.TestCase):
             self.assertEqual(rebuilt.turn_number, 1)
             self.assertEqual(rebuilt.format_name, "[Gen 9] Random Battle")
 
+    def test_multi_active_hints_do_not_flatten_move_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "config" / "agents.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    agents:
+                      - id: doubles-agent
+                        enabled: true
+                        provider: codex
+                        player_slot: p1
+                        format_allowlist: [gen4doublescustomgame]
+                        transport: sim-stream
+                        launch:
+                          command: cat
+                          args: []
+                          cwd: .
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            agent = find_agent(load_agents_config(project_root=root), "doubles-agent")
+            session = BattleSession(battle_id="battle-doubles", player_slot="p1", history_limit=20)
+            session.ingest(_public_event("battle-doubles", ["|turn|2"]))
+            session.ingest(
+                _request_event(
+                    "battle-doubles",
+                    "p1",
+                    {
+                        "active": [
+                            {"moves": [{"move": "Surf", "id": "surf", "disabled": False}]},
+                            {"moves": [{"move": "Protect", "id": "protect", "disabled": False}]},
+                        ],
+                        "side": {
+                            "pokemon": [
+                                {"ident": "p1a: Lapras", "condition": "100/100", "active": True},
+                                {"ident": "p1b: Snorlax", "condition": "100/100", "active": True},
+                            ]
+                        },
+                    },
+                )
+            )
+
+            context = session.build_turn_context(
+                agent=agent,
+                cursor=AgentContextCursor(last_turn_number=1, last_request_sequence=0),
+            )
+
+            self.assertEqual(context.legal_action_hints, ["wait"])
+
     def test_parse_decision_output_accepts_json_and_plain_text(self) -> None:
         json_decision = parse_decision_output(
             '{"schema_version":"pokerena.decision.v1","decision":"move 1","notes":"safe"}',

@@ -37,7 +37,7 @@
     },
     "player_slot": {
       "type": "string",
-      "pattern": "^p[1-4]$"
+      "pattern": "^p[12]$"
     },
     "context_token": {
       "type": "string",

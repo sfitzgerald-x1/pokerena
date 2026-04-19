@@ -189,7 +189,6 @@ class BattleSession:
             recent_public_events=list(self.public_history),
             last_error=self.last_error,
         )
-        _validate_schema("turn-context.v1.json", asdict(context))
         return context
 
     def advance_cursor(self) -> AgentContextCursor:
@@ -342,7 +341,8 @@ class SimStreamAdapter:
             line = self.process.stdout.readline()
             if line == "":
                 stderr = ""
-                if self.process.stderr is not None:
+                returncode = self.process.poll()
+                if returncode is not None and self.process.stderr is not None:
                     stderr = self.process.stderr.read().strip()
                 raise ConfigError(
                     f"Simulator stream ended unexpectedly for {self.battle_id}."
@@ -793,7 +793,7 @@ def _legal_action_hints(request: Optional[Dict[str, Any]]) -> List[str]:
                 hints.append(f"switch {index}")
 
     active = request.get("active")
-    if isinstance(active, list):
+    if isinstance(active, list) and len(active) == 1:
         for active_slot in active:
             if not isinstance(active_slot, dict):
                 continue
