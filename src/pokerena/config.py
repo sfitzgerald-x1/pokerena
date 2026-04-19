@@ -35,12 +35,23 @@ class AgentLaunchConfig:
 
 
 @dataclass(frozen=True)
+class AgentHookConfig:
+    type: str
+    context_format: str
+    decision_format: str
+    prompt_style: str
+
+
+@dataclass(frozen=True)
 class AgentDefinition:
     agent_id: str
     enabled: bool
+    provider: str
+    player_slot: str
     format_allowlist: List[str]
     transport: str
     launch: AgentLaunchConfig
+    hook: AgentHookConfig
     env_file: Optional[Path]
 
 
@@ -54,6 +65,11 @@ ENVIRONMENT_OVERRIDES = {
     "POKERENA_DATA_DIR": "data_dir",
     "POKERENA_LOG_DIR": "log_dir",
 }
+
+ALLOWED_AGENT_TRANSPORTS = {"sim-stream", "showdown-client"}
+ALLOWED_CONTEXT_FORMATS = {"pokerena.turn-context.v1"}
+ALLOWED_DECISION_FORMATS = {"pokerena.decision.v1"}
+ALLOWED_PROMPT_STYLES = {"showdown-turn-v1"}
 
 
 def load_server_config(
@@ -137,6 +153,36 @@ def load_agents_config(
         if not isinstance(allowlist, list) or any(not isinstance(item, str) for item in allowlist):
             raise ConfigError(f"agents[{index}].format_allowlist must be a list of strings.")
 
+        hook = raw_agent.get("hook", {})
+        if hook is None:
+            hook = {}
+        if not isinstance(hook, dict):
+            raise ConfigError(f"agents[{index}].hook must be a mapping.")
+
+        context_format = _optional_string(
+            hook.get("context_format"),
+            default="pokerena.turn-context.v1",
+        )
+        if context_format not in ALLOWED_CONTEXT_FORMATS:
+            allowed = ", ".join(sorted(ALLOWED_CONTEXT_FORMATS))
+            raise ConfigError(f"agents[{index}].hook.context_format must be one of: {allowed}.")
+
+        decision_format = _optional_string(
+            hook.get("decision_format"),
+            default="pokerena.decision.v1",
+        )
+        if decision_format not in ALLOWED_DECISION_FORMATS:
+            allowed = ", ".join(sorted(ALLOWED_DECISION_FORMATS))
+            raise ConfigError(f"agents[{index}].hook.decision_format must be one of: {allowed}.")
+
+        prompt_style = _optional_string(
+            hook.get("prompt_style"),
+            default="showdown-turn-v1",
+        )
+        if prompt_style not in ALLOWED_PROMPT_STYLES:
+            allowed = ", ".join(sorted(ALLOWED_PROMPT_STYLES))
+            raise ConfigError(f"agents[{index}].hook.prompt_style must be one of: {allowed}.")
+
         env_file_value = raw_agent.get("env_file")
         env_file = None
         if env_file_value is not None:
@@ -144,13 +190,28 @@ def load_agents_config(
                 raise ConfigError(f"agents[{index}].env_file must be a non-empty string if set.")
             env_file = _resolve_project_path(root, env_file_value)
 
+        transport = _required_string(raw_agent, "transport", prefix=f"agents[{index}]")
+        if transport not in ALLOWED_AGENT_TRANSPORTS:
+            allowed = ", ".join(sorted(ALLOWED_AGENT_TRANSPORTS))
+            raise ConfigError(
+                f"agents[{index}].transport must be one of: {allowed}."
+            )
+
         agents.append(
             AgentDefinition(
                 agent_id=_required_string(raw_agent, "id", prefix=f"agents[{index}]"),
                 enabled=_parse_bool(raw_agent.get("enabled", True)),
+                provider=_optional_string(raw_agent.get("provider"), default="generic"),
+                player_slot=_optional_string(raw_agent.get("player_slot"), default="p1"),
                 format_allowlist=allowlist,
-                transport=_required_string(raw_agent, "transport", prefix=f"agents[{index}]"),
+                transport=transport,
                 launch=AgentLaunchConfig(command=command, args=list(args), cwd=launch_cwd),
+                hook=AgentHookConfig(
+                    type=_optional_string(hook.get("type"), default="subprocess_stdio"),
+                    context_format=context_format,
+                    decision_format=decision_format,
+                    prompt_style=prompt_style,
+                ),
                 env_file=env_file,
             )
         )
@@ -220,6 +281,14 @@ def _required_string(
     return value.strip()
 
 
+def _optional_string(value: object, default: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"Expected a non-empty string value, got {value!r}.")
+    return value.strip()
+
+
 def _parse_port(value: object) -> int:
     try:
         port = int(value)
@@ -240,4 +309,3 @@ def _parse_bool(value: object) -> bool:
         if normalized in {"0", "false", "no", "off"}:
             return False
     raise ConfigError(f"Expected a boolean value, got {value!r}.")
-
