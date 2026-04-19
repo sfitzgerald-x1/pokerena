@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import textwrap
 import unittest
+import random
 
 from pokerena.agent import (
+    AgentCancelledError,
     AgentContextCursor,
     BattleSession,
+    ShowdownClientAdapter,
     SimStreamAdapter,
+    _run_hook_process,
     build_session_from_capture,
     choose_first_legal,
+    choose_random_legal,
     find_agent,
     load_capture,
     parse_decision_output,
+    render_turn_prompt,
     save_capture,
 )
 from pokerena.config import ServerConfig, load_agents_config
@@ -92,6 +99,7 @@ class BattleAgentRuntimeTest(unittest.TestCase):
             self.assertTrue(context.signals["turn_started"])
             self.assertTrue(context.signals["request_updated"])
             self.assertIn("move 1", context.legal_action_hints)
+            self.assertIn("switch 2", context.legal_action_hints)
             self.assertEqual(context.turn_number, 3)
 
     def test_invalid_choice_update_reuses_synthetic_request_id(self) -> None:
@@ -141,8 +149,59 @@ class BattleAgentRuntimeTest(unittest.TestCase):
 
             self.assertEqual(context.rqid, first_rqid)
             self.assertEqual(context.decision_attempt, 2)
-            self.assertEqual(context.last_error, None)
+            self.assertEqual(context.last_error, "[Unavailable choice] Can't move there")
             self.assertTrue(context.signals["request_updated"])
+
+    def test_context_uses_turn_bounded_public_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "config" / "agents.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    agents:
+                      - id: test-agent
+                        enabled: true
+                        provider: claude
+                        player_slot: p1
+                        format_allowlist: [gen3randombattle]
+                        transport: sim-stream
+                        launch:
+                          command: cat
+                          args: []
+                          cwd: .
+                        hook:
+                          history_turn_limit: 2
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            agent = find_agent(load_agents_config(project_root=root), "test-agent")
+            session = BattleSession(battle_id="battle-history", player_slot="p1", history_limit=20)
+            session.ingest(_public_event("battle-history", ["|turn|1", "|move|p1a: A|Surf|p2a: B"]))
+            session.ingest(_public_event("battle-history", ["|turn|2", "|move|p2a: B|Thunderbolt|p1a: A"]))
+            session.ingest(_public_event("battle-history", ["|turn|3", "|move|p1a: A|Ice Beam|p2a: B"]))
+            session.ingest(
+                _request_event(
+                    "battle-history",
+                    "p1",
+                    {
+                        "active": [{"moves": [{"move": "Recover", "id": "recover", "disabled": False}]}],
+                        "side": {"pokemon": [{"ident": "p1: A", "condition": "50/100", "active": True}]},
+                        "rqid": 8,
+                    },
+                )
+            )
+
+            context = session.build_turn_context(
+                agent=agent,
+                cursor=AgentContextCursor(last_turn_number=2, last_request_sequence=0),
+            )
+
+            self.assertNotIn("|turn|1", context.recent_public_events)
+            self.assertIn("|turn|2", context.recent_public_events)
+            self.assertIn("|turn|3", context.recent_public_events)
 
     def test_capture_replay_reconstructs_session_state(self) -> None:
         session = BattleSession(battle_id="battle-3", player_slot="p1", history_limit=20)
@@ -231,6 +290,13 @@ class BattleAgentRuntimeTest(unittest.TestCase):
         plain_decision = parse_decision_output("switch 2\n", "pokerena.decision.v1")
         self.assertEqual(plain_decision.decision, "switch 2")
 
+        mixed_output = parse_decision_output(
+            'Correcting my decision first.\n\n{"schema_version":"pokerena.decision.v1","decision":"move 1","notes":"actual json"}',
+            "pokerena.decision.v1",
+        )
+        self.assertEqual(mixed_output.decision, "move 1")
+        self.assertEqual(mixed_output.notes, "actual json")
+
     def test_choose_first_legal_covers_common_request_shapes(self) -> None:
         move_choice = choose_first_legal(
             {
@@ -266,6 +332,313 @@ class BattleAgentRuntimeTest(unittest.TestCase):
             }
         )
         self.assertEqual(team_choice, "team 123")
+
+    def test_choose_random_legal_covers_common_request_shapes(self) -> None:
+        rng = random.Random(7)
+
+        move_choice = choose_random_legal(
+            {
+                "active": [
+                    {
+                        "moves": [
+                            {"move": "Surf", "id": "surf", "disabled": False},
+                            {"move": "Ice Beam", "id": "icebeam", "disabled": False},
+                        ]
+                    }
+                ],
+                "side": {"pokemon": [{"ident": "p1: Lapras", "condition": "100/100", "active": True}]},
+            },
+            rng=rng,
+        )
+        self.assertIn(move_choice, {"move 1", "move 2"})
+
+        move_or_switch_choice = choose_random_legal(
+            {
+                "active": [
+                    {
+                        "moves": [
+                            {"move": "Surf", "id": "surf", "disabled": False},
+                            {"move": "Ice Beam", "id": "icebeam", "disabled": False},
+                        ]
+                    }
+                ],
+                "side": {
+                    "pokemon": [
+                        {"ident": "p1: Lapras", "condition": "100/100", "active": True},
+                        {"ident": "p1: Jolteon", "condition": "100/100", "active": False},
+                        {"ident": "p1: Snorlax", "condition": "100/100", "active": False},
+                    ]
+                },
+            },
+            rng=rng,
+        )
+        self.assertIn(move_or_switch_choice, {"move 1", "move 2", "switch 2", "switch 3"})
+
+        switch_choice = choose_random_legal(
+            {
+                "forceSwitch": [True],
+                "side": {
+                    "pokemon": [
+                        {"ident": "p1: Landorus", "condition": "0 fnt", "active": True},
+                        {"ident": "p1: Corviknight", "condition": "100/100", "active": False},
+                        {"ident": "p1: Gholdengo", "condition": "100/100", "active": False},
+                    ]
+                },
+            },
+            rng=rng,
+        )
+        self.assertIn(switch_choice, {"switch 2", "switch 3"})
+
+        team_choice = choose_random_legal(
+            {
+                "teamPreview": True,
+                "side": {
+                    "pokemon": [
+                        {"ident": "p1: A"},
+                        {"ident": "p1: B"},
+                        {"ident": "p1: C"},
+                    ]
+                },
+            },
+            rng=rng,
+        )
+        self.assertTrue(team_choice.startswith("team "))
+        self.assertEqual(sorted(team_choice.replace("team ", "")), ["1", "2", "3"])
+
+    def test_choose_random_legal_avoids_voluntary_switch_when_trapped(self) -> None:
+        rng = random.Random(11)
+        choice = choose_random_legal(
+            {
+                "active": [
+                    {
+                        "moves": [
+                            {"move": "Surf", "id": "surf", "disabled": False},
+                            {"move": "Ice Beam", "id": "icebeam", "disabled": False},
+                        ],
+                        "trapped": True,
+                    }
+                ],
+                "side": {
+                    "pokemon": [
+                        {"ident": "p1: Lapras", "condition": "100/100", "active": True},
+                        {"ident": "p1: Jolteon", "condition": "100/100", "active": False},
+                    ]
+                },
+            },
+            rng=rng,
+        )
+        self.assertIn(choice, {"move 1", "move 2"})
+
+    def test_render_turn_prompt_includes_damage_calc_guidance_for_move_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "config" / "agents.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    agents:
+                      - id: calc-agent
+                        enabled: true
+                        provider: claude
+                        player_slot: p2
+                        format_allowlist: [gen3randombattle]
+                        transport: showdown-client
+                        launch:
+                          command: claude
+                          args: ["-p"]
+                          cwd: .
+                        callable:
+                          enabled: true
+                          username: ClaudeLocalBot
+                          accepted_formats: [gen3randombattle]
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            agent = load_agents_config(project_root=root)[0]
+            session = BattleSession(battle_id="battle-prompt", player_slot="p2", history_limit=20)
+            session.ingest(
+                _public_event(
+                    "battle-prompt",
+                    [
+                        "|gen|3",
+                        "|tier|[Gen 3] Random Battle",
+                        "|switch|p1a: Camerupt|Camerupt, L89, F|100/100",
+                        "|switch|p2a: Ludicolo|Ludicolo, L84, F|272/272",
+                        "|turn|1",
+                    ],
+                )
+            )
+            session.ingest(
+                _request_event(
+                    "battle-prompt",
+                    "p2",
+                    {
+                        "active": [
+                            {
+                                "moves": [
+                                    {
+                                        "move": "Hidden Power Grass 70",
+                                        "id": "hiddenpower",
+                                        "disabled": False,
+                                        "category": "Special",
+                                        "basePower": 70,
+                                    },
+                                    {
+                                        "move": "Rain Dance",
+                                        "id": "raindance",
+                                        "disabled": False,
+                                        "category": "Status",
+                                        "basePower": 0,
+                                    },
+                                ]
+                            }
+                        ],
+                        "side": {
+                            "pokemon": [
+                                {
+                                    "ident": "p2: Ludicolo",
+                                    "details": "Ludicolo, L84, F",
+                                    "condition": "272/272",
+                                    "active": True,
+                                    "item": "leftovers",
+                                    "baseAbility": "swiftswim",
+                                    "stats": {"atk": 124, "def": 166, "spa": 199, "spd": 216, "spe": 166},
+                                }
+                            ]
+                        },
+                        "rqid": 3,
+                    },
+                )
+            )
+
+            context = session.build_turn_context(
+                agent=agent,
+                cursor=AgentContextCursor(last_turn_number=0, last_request_sequence=0),
+            )
+            prompt_text = render_turn_prompt(agent, context)
+
+            self.assertIn("DAMAGE CALC WORKFLOW", prompt_text)
+            self.assertIn("python3.14 -m pokerena calc damage-batch --stdin", prompt_text)
+            self.assertIn("Hidden Power Grass 70", prompt_text)
+            self.assertIn("Move 2 · Rain Dance — non-damaging/status move; reason heuristically.", prompt_text)
+            self.assertIn("\"generation\": 3", prompt_text)
+            self.assertIn("\"species\": \"Camerupt\"", prompt_text)
+
+    def test_render_turn_prompt_skips_damage_calc_guidance_for_switch_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "config" / "agents.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    agents:
+                      - id: switch-agent
+                        enabled: true
+                        provider: claude
+                        player_slot: p2
+                        format_allowlist: [gen3randombattle]
+                        transport: showdown-client
+                        launch:
+                          command: claude
+                          args: ["-p"]
+                          cwd: .
+                        callable:
+                          enabled: true
+                          username: ClaudeLocalBot
+                          accepted_formats: [gen3randombattle]
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            agent = load_agents_config(project_root=root)[0]
+            session = BattleSession(battle_id="battle-switch", player_slot="p2", history_limit=20)
+            session.ingest(_public_event("battle-switch", ["|gen|3", "|tier|[Gen 3] Random Battle", "|turn|4"]))
+            session.ingest(
+                _request_event(
+                    "battle-switch",
+                    "p2",
+                    {
+                        "forceSwitch": [True],
+                        "side": {
+                            "pokemon": [
+                                {"ident": "p2: Ludicolo", "details": "Ludicolo, L84, F", "condition": "0 fnt", "active": True},
+                                {"ident": "p2: Glalie", "details": "Glalie, L82, F", "condition": "265/265", "active": False},
+                            ]
+                        },
+                        "rqid": 11,
+                    },
+                )
+            )
+            context = session.build_turn_context(
+                agent=agent,
+                cursor=AgentContextCursor(last_turn_number=3, last_request_sequence=0),
+            )
+
+            prompt_text = render_turn_prompt(agent, context)
+
+            self.assertNotIn("DAMAGE CALC WORKFLOW", prompt_text)
+
+    def test_render_turn_prompt_mentions_voluntary_switching_on_move_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            (root / "config" / "agents.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    agents:
+                      - id: switch-aware-agent
+                        enabled: true
+                        provider: claude
+                        player_slot: p1
+                        format_allowlist: [gen3randombattle]
+                        transport: showdown-client
+                        launch:
+                          command: claude
+                          args: ["-p"]
+                          cwd: .
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            agent = load_agents_config(project_root=root)[0]
+            session = BattleSession(battle_id="battle-voluntary-switch", player_slot="p1", history_limit=20)
+            session.ingest(_public_event("battle-voluntary-switch", ["|gen|3", "|tier|[Gen 3] Random Battle", "|turn|6"]))
+            session.ingest(
+                _request_event(
+                    "battle-voluntary-switch",
+                    "p1",
+                    {
+                        "active": [
+                            {
+                                "moves": [
+                                    {"move": "Surf", "id": "surf", "disabled": False},
+                                    {"move": "Rain Dance", "id": "raindance", "disabled": False, "category": "Status"},
+                                ]
+                            }
+                        ],
+                        "side": {
+                            "pokemon": [
+                                {"ident": "p1: Lapras", "details": "Lapras, L76, F", "condition": "100/100", "active": True},
+                                {"ident": "p1: Jolteon", "details": "Jolteon, L78, M", "condition": "100/100", "active": False},
+                            ]
+                        },
+                        "rqid": 14,
+                    },
+                )
+            )
+            context = session.build_turn_context(
+                agent=agent,
+                cursor=AgentContextCursor(last_turn_number=5, last_request_sequence=0),
+            )
+
+            prompt_text = render_turn_prompt(agent, context)
+
+            self.assertIn("VOLUNTARY SWITCHING", prompt_text)
+            self.assertIn("switch 2", prompt_text)
 
     def test_sim_stream_adapter_round_trips_real_requests(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -362,6 +735,100 @@ class BattleAgentRuntimeTest(unittest.TestCase):
         self.assertEqual(events[0].event_type, "public_update")
         self.assertEqual(events[0].payload["lines"], ["|turn|1"])
 
+    def test_showdown_client_adapter_accepts_supported_direct_challenge(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+        adapter.authenticated = True
+
+        events = adapter._consume_message(
+            '|updatechallenges|{"challengesFrom":{"human":"gen3randombattle"}}'
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(fake_connection.sent, ["|/utm null", "|/accept human"])
+        self.assertEqual(adapter.pending_challenger, "human")
+        self.assertEqual(adapter.pending_format, "gen3randombattle")
+
+    def test_showdown_client_adapter_rejects_unsupported_direct_challenge(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+        adapter.authenticated = True
+
+        events = adapter._consume_message(
+            '|updatechallenges|{"challengesFrom":{"human":"gen4randombattle"}}'
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(
+            fake_connection.sent,
+            [
+                "|/pm human, I only accept these formats: gen3randombattle.",
+                "|/reject human",
+            ],
+        )
+
+    def test_showdown_client_adapter_accepts_pm_challenge_messages(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+        adapter.authenticated = True
+
+        events = adapter._consume_message(
+            "|pm| human123| ClaudeLocalBot|/challenge gen3randombattle|gen3randombattle|||"
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(fake_connection.sent, ["|/utm null", "|/accept human123"])
+
+    def test_showdown_client_adapter_parses_battle_room_and_submits_choice(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+        adapter.authenticated = True
+        adapter.pending_challenger = "human"
+        adapter.pending_format = "gen3randombattle"
+
+        events = adapter._consume_message(
+            textwrap.dedent(
+                """
+                >battle-gen3randombattle-1
+                |init|battle
+                |title|ClaudeLocalBot vs. human
+                |tier|[Gen 3] Random Battle
+                |turn|1
+                |request|{"rqid":7,"active":[{"moves":[{"move":"Surf","id":"surf","disabled":false}]}],"side":{"pokemon":[{"ident":"p1: Lapras","condition":"100/100","active":true}]}}
+                """
+            ).strip()
+        )
+
+        self.assertEqual(events[0].event_type, "battle_started")
+        self.assertEqual(events[0].battle_id, "battle-gen3randombattle-1")
+        self.assertEqual(events[1].event_type, "public_update")
+        self.assertIn("|tier|[Gen 3] Random Battle", events[1].payload["lines"])
+        self.assertEqual(events[2].event_type, "request_received")
+        self.assertEqual(events[2].payload["rqid"], 7)
+
+        adapter.submit_decision(player_slot="p1", choice="move 1", rqid="7")
+        self.assertEqual(fake_connection.sent, ["battle-gen3randombattle-1|/choose move 1|7"])
+
+    def test_hook_process_can_be_cancelled(self) -> None:
+        with self.assertRaises(AgentCancelledError) as error:
+            _run_hook_process(
+                command=["python3.14", "-c", "import time; time.sleep(30)"],
+                cwd=Path.cwd(),
+                env=os.environ.copy(),
+                prompt_text="prompt",
+                timeout_seconds=30,
+                expected_schema="pokerena.decision.v1",
+                claude_streaming=False,
+                trace_sink=None,
+                cancel_check=lambda: "Battle manually stopped from Battle Sessions.",
+            )
+
+        self.assertIn("manually stopped", str(error.exception))
+
 
 def _public_event(battle_id: str, lines: list[str]):
     from pokerena.agent import SessionEvent
@@ -389,3 +856,62 @@ def _rejection_event(battle_id: str, player_slot: str, message: str):
         player_slot=player_slot,
         payload={"message": message},
     )
+
+
+def _server_config() -> ServerConfig:
+    repo_root = Path(__file__).resolve().parents[1]
+    return ServerConfig(
+        project_root=repo_root,
+        config_path=repo_root / "config" / "server.local.example.yaml",
+        showdown_path=repo_root / "vendor" / "pokemon-showdown",
+        bind_address="127.0.0.1",
+        port=8000,
+        server_id="pokerena-local",
+        public_origin="http://localhost:8000",
+        no_security=True,
+        data_dir=repo_root / ".runtime" / "showdown" / "data",
+        log_dir=repo_root / ".runtime" / "showdown" / "logs",
+        runtime_dir=repo_root / ".runtime" / "showdown",
+    )
+
+
+def _load_showdown_agent():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "config").mkdir()
+        (root / "config" / "agents.yaml").write_text(
+            textwrap.dedent(
+                """
+                agents:
+                  - id: showdown-agent
+                    enabled: true
+                    provider: claude
+                    player_slot: p1
+                    format_allowlist: [gen3randombattle]
+                    transport: showdown-client
+                    launch:
+                      command: cat
+                      args: []
+                      cwd: .
+                    callable:
+                      enabled: true
+                      username: ClaudeLocalBot
+                      accepted_formats: [gen3randombattle]
+                      challenge_policy: accept-direct-challenges
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        return find_agent(load_agents_config(project_root=root), "showdown-agent")
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def send(self, payload: str) -> None:
+        self.sent.append(payload)
+
+    def close(self) -> None:
+        return
