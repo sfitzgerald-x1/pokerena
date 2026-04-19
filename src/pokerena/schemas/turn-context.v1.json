@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pokerena Turn Context v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "battle_id",
+    "agent_id",
+    "provider",
+    "player_slot",
+    "context_token",
+    "phase",
+    "request_kind",
+    "request_sequence",
+    "decision_attempt",
+    "signals",
+    "legal_action_hints",
+    "active",
+    "recent_public_events"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "pokerena.turn-context.v1"
+    },
+    "battle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1
+    },
+    "player_slot": {
+      "type": "string",
+      "pattern": "^p[1-4]$"
+    },
+    "context_token": {
+      "type": "string",
+      "minLength": 1
+    },
+    "format_name": {
+      "type": ["string", "null"]
+    },
+    "turn_number": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "phase": {
+      "type": "string",
+      "minLength": 1
+    },
+    "request_kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rqid": {
+      "type": ["string", "null"]
+    },
+    "request_sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "decision_attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turn_started",
+        "request_updated",
+        "decision_required",
+        "best_effort_reprime"
+      ],
+      "properties": {
+        "turn_started": {
+          "type": "boolean"
+        },
+        "request_updated": {
+          "type": "boolean"
+        },
+        "decision_required": {
+          "type": "boolean"
+        },
+        "best_effort_reprime": {
+          "type": "boolean"
+        }
+      }
+    },
+    "legal_action_hints": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "request": {
+      "type": ["object", "null"]
+    },
+    "side": {
+      "type": ["object", "null"]
+    },
+    "active": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "recent_public_events": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "last_error": {
+      "type": ["string", "null"]
+    }
+  }
+}

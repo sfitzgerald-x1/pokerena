@@ -1,14 +1,20 @@
 agents:
   - id: example-randbat-bot
     enabled: false
+    provider: codex
+    player_slot: p1
     format_allowlist:
       - gen9randombattle
-    transport: subprocess
+    transport: sim-stream
     launch:
       command: python3.14
       args:
         - -m
         - my_agent_module
       cwd: .
+    hook:
+      type: subprocess_stdio
+      context_format: pokerena.turn-context.v1
+      decision_format: pokerena.decision.v1
+      prompt_style: showdown-turn-v1
     env_file: .env
-

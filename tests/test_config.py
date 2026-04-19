@@ -62,7 +62,7 @@ class ConfigLoadingTest(unittest.TestCase):
                         enabled: true
                         format_allowlist:
                           - gen9randombattle
-                        transport: subprocess
+                        transport: sim-stream
                         launch:
                           command: python3.14
                           args: ["-m", "bot"]
@@ -79,6 +79,8 @@ class ConfigLoadingTest(unittest.TestCase):
             self.assertEqual(len(agents), 1)
             self.assertEqual(agents[0].agent_id, "test-bot")
             self.assertEqual(agents[0].launch.command, "python3.14")
+            self.assertEqual(agents[0].transport, "sim-stream")
+            self.assertEqual(agents[0].hook.context_format, "pokerena.turn-context.v1")
 
     def test_load_server_config_requires_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
