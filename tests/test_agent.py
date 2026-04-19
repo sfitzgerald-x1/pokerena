@@ -331,6 +331,37 @@ class BattleAgentRuntimeTest(unittest.TestCase):
         finally:
             adapter.close()
 
+    def test_sim_stream_adapter_ignores_launcher_preamble(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        showdown_path = repo_root / "vendor" / "pokemon-showdown"
+        server_config = ServerConfig(
+            project_root=repo_root,
+            config_path=repo_root / "config" / "server.local.example.yaml",
+            showdown_path=showdown_path,
+            bind_address="127.0.0.1",
+            port=8000,
+            server_id="pokerena-local",
+            public_origin="http://localhost:8000",
+            no_security=True,
+            data_dir=repo_root / ".runtime" / "showdown" / "data",
+            log_dir=repo_root / ".runtime" / "showdown" / "logs",
+            runtime_dir=repo_root / ".runtime" / "showdown",
+        )
+        adapter = SimStreamAdapter(
+            server_config=server_config,
+            format_id="gen9randombattle",
+            battle_id="sim-test",
+            player_names={"p1": "Alpha", "p2": "Beta"},
+        )
+
+        events = adapter._parse_chunk(
+            "config.js does not exist. Creating one with default settings...\nupdate\n|turn|1"
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "public_update")
+        self.assertEqual(events[0].payload["lines"], ["|turn|1"])
+
 
 def _public_event(battle_id: str, lines: list[str]):
     from pokerena.agent import SessionEvent

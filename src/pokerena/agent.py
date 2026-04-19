@@ -356,9 +356,17 @@ class SimStreamAdapter:
             lines.append(line)
 
     def _parse_chunk(self, chunk: str) -> List[SessionEvent]:
-        if "\n" not in chunk:
+        lines = chunk.splitlines()
+        recognized_types = {"update", "sideupdate", "end"}
+        while lines and lines[0] not in recognized_types:
+            lines.pop(0)
+        if not lines:
+            return []
+
+        normalized_chunk = "\n".join(lines)
+        if "\n" not in normalized_chunk:
             raise ConfigError(f"Malformed simulator chunk: {chunk}")
-        message_type, _, remainder = chunk.partition("\n")
+        message_type, _, remainder = normalized_chunk.partition("\n")
         if message_type == "update":
             public_lines = _extract_public_lines(remainder.splitlines())
             return [
