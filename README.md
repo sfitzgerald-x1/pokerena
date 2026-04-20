@@ -1,12 +1,12 @@
 # Pokérena
 
-Pokérena is a Python-led harness for running a local Pokemon Showdown server that can later host LLM-powered battle agents. This first scaffold focuses on standing up a pinned local server with a clean config layer for future agent integrations.
+Pokérena is a Python-led harness for running a local Pokemon Showdown server and wiring local battle agents into it. The current scaffold stands up a pinned local server, exposes a stable subprocess hook for agents, and can now bring callable local bots online so you can challenge them from the browser.
 
 ## What This PR Sets Up
 
 - A pinned Pokemon Showdown submodule under `vendor/pokemon-showdown`
 - A repo-owned damage calc wrapper built on the official `@smogon/calc` package
-- A Python 3.14 CLI for environment checks, generated config rendering, and server startup
+- A Python 3.14 CLI for environment checks, generated config rendering, server startup, and agent runtimes
 - YAML config files for local server settings and future agent definitions
 - Host-run and Docker startup paths that use the same Pokerena config
 
@@ -62,13 +62,13 @@ Preview the command without starting the process:
 python3.14 -m pokerena server up --config config/server.local.yaml --dry-run
 ```
 
-Start the local server:
+Start the local server and any enabled callable local agents:
 
 ```bash
-python3.14 -m pokerena server up --config config/server.local.yaml
+python3.14 -m pokerena server up --config config/server.local.yaml --agents-config config/agents.yaml
 ```
 
-By default, the local server will be reachable at http://localhost:8000.
+By default, the local server will be reachable at http://localhost:8000. If an agent has `callable.enabled: true`, `server up` will also start that bot process, wait for the server to come online, and keep the child processes tied to the server lifecycle.
 
 ## Docker Flow
 
@@ -100,14 +100,22 @@ This mounts your local config files read-only and writes generated runtime state
 - `transport`
 - `launch.command`
 - `launch.args`
+- `env_file`
 - `hook.type`
 - `hook.context_format`
 - `hook.decision_format`
 - `hook.prompt_style`
+- `callable.enabled`
+- `callable.username`
+- `callable.accepted_formats`
+- `callable.challenge_policy`
+- `callable.avatar`
+
+Keep checked-in configs free of secrets. Use `.env` or an agent-specific `env_file` for anything sensitive or machine-local. The local callable flow in this repo does not require a password or registered Showdown account; it relies on `no_security: true` plus a local rename.
 
 ## Damage Calc Wrapper
 
-Pokérena exposes damage calculation through its own CLI instead of asking agents to call Node directly. The wrapper delegates to the official `@smogon/calc` package locally and returns stable JSON.
+Pokérena exposes damage calculation through its own CLI instead of asking agents to call Node directly. The wrapper delegates to the official `@smogon/calc` package locally, keeps a small worker alive under `.runtime/calc/`, and returns stable JSON.
 
 Use a JSON file:
 
@@ -119,6 +127,12 @@ Or pipe the request on stdin:
 
 ```bash
 cat damage-request.json | python3.14 -m pokerena calc damage --stdin
+```
+
+For move comparisons, batch multiple requests in one call:
+
+```bash
+cat damage-batch-request.json | python3.14 -m pokerena calc damage-batch --stdin
 ```
 
 The input shape is intentionally narrow for v1:
@@ -157,7 +171,7 @@ The wrapper returns JSON with:
 - `description`
 - `knockout`
 
-Agents should call `python3.14 -m pokerena calc damage`, not `node`, so the command surface stays stable even if the underlying Node implementation changes later.
+Agents should call `python3.14 -m pokerena calc damage` or `python3.14 -m pokerena calc damage-batch`, not `node`, so the command surface stays stable even if the underlying Node implementation changes later.
 
 The deprecated `./scripts/bootstrap-showdown.sh` path still forwards to `./scripts/bootstrap-node-deps.sh` for now, so existing local setup notes keep working while the new name settles in.
 
@@ -205,7 +219,49 @@ python3.14 -m pokerena agent sim-battle \
   --dry-run
 ```
 
-The live runtime applies a per-decision timeout and a max invalid-choice retry policy. If the agent times out or keeps returning illegal choices, Pokérena falls back to the built-in `first-legal` policy for that request so the battle can continue deterministically.
+The live runtime applies a per-decision timeout and a max invalid-choice retry policy. Timeouts fall back to a random legal action for the current request shape, while repeated invalid choices still fall back to the built-in `first-legal` policy so the battle can continue.
+
+### Local Browser Challenges
+
+For human-vs-agent testing on your local Showdown server, set an agent to `transport: showdown-client` and enable its `callable` block. The bot logs in locally with `/trn USERNAME` under `--no-security`, so you do not need to store a Showdown password in the repo.
+
+Example callable block:
+
+```yaml
+callable:
+  enabled: true
+  username: LocalAgentBot
+  accepted_formats:
+    - gen3randombattle
+  challenge_policy: accept-direct-challenges
+```
+
+You can also tune how much recent battle history the hook receives on each turn, and how long Pokerena waits before timing out the turn:
+
+```yaml
+hook:
+  history_turn_limit: 4
+  decision_timeout_seconds: 120
+```
+
+Then start the server:
+
+```bash
+python3.14 -m pokerena server up --config config/server.local.yaml --agents-config config/agents.yaml
+```
+
+Open the local Showdown UI in your browser, challenge your configured bot username to `gen3randombattle`, and the bot will auto-accept matching direct challenges. Unsupported formats are rejected with a PM, and bot names stay local to your machine unless you later add env-backed auth for another environment.
+
+When the transcript viewer is enabled, `server up` also starts a separate local Battle Sessions page on `http://localhost:8001` by default. Open it beside the battle to watch newest-first turn cards, a live fixed-height trace while the agent is thinking, compact helper activity, and a prompt modal for the full context Pokerena passed into the hook. Live showdown-client sessions can be stopped from the page, which cancels the current agent turn and forfeits the battle, and finished sessions can be moved to Trash directly from the same UI. Finished sessions also get a summary card with result, total turns, average decision time, and any token totals the provider exposed.
+
+If you want to run the bot transport directly without `server up`, use:
+
+```bash
+python3.14 -m pokerena agent showdown-client \
+  --config config/server.local.yaml \
+  --agents-config config/agents.yaml \
+  --agent-id example-randbat-bot
+```
 
 ### Replay And Debugging
 
@@ -231,10 +287,12 @@ python3.14 -m pokerena agent decide \
 
 The hook writes its exact turn context, prompt, response, and cursor state into `.runtime/agents/<agent-id>/<battle-id>/`.
 
+Pokérena also writes `.runtime/agents/<agent-id>/<battle-id>/transcript.json`, which is the canonical structured source for the local Battle Sessions viewer. Battle session storage stays file-based under `.runtime/agents/<agent-id>/<battle-id>/`, with `capture.json`, `cursor.json`, `transcript.json`, and the latest turn artifacts side by side. Deleting a finished session from the UI moves that directory to the OS Trash instead of deleting it permanently.
+
 ### Adapter Status
 
 - `sim-stream` is the first end-to-end adapter and is the default local development path.
-- `showdown-client` is defined as a future adapter shape, but it is not implemented yet.
+- `showdown-client` now supports local direct challenges on the local Pokerena Showdown server.
 - Public main-server play is intentionally not enabled by default in this scaffold.
 
 ## Notes

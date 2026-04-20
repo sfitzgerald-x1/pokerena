@@ -2,6 +2,7 @@ import json
 import os
 from io import StringIO
 from pathlib import Path
+import socket
 import subprocess
 import shutil
 import tempfile
@@ -10,10 +11,15 @@ import unittest
 from unittest import mock
 
 from pokerena.calc import (
+    CALC_BATCH_REQUEST_SCHEMA_VERSION,
     CALC_REQUEST_SCHEMA_VERSION,
+    _send_worker_request,
     detect_project_root,
+    read_damage_calc_batch_input,
     read_damage_calc_input,
+    run_damage_calc_batch,
     run_damage_calc,
+    sample_damage_calc_batch_payload,
     sample_damage_calc_payload,
 )
 from pokerena.cli import collect_doctor_checks, main
@@ -41,6 +47,16 @@ class DamageCalcTest(unittest.TestCase):
         self.assertEqual(payload["defender"]["species"], "Raikou")
         self.assertEqual(payload["move"]["name"], "Double-Edge")
 
+    def test_read_damage_calc_batch_input_from_stdin(self) -> None:
+        payload = read_damage_calc_batch_input(
+            input_path=None,
+            use_stdin=True,
+            stdin_text=json.dumps(sample_damage_calc_batch_payload()),
+        )
+
+        self.assertEqual(payload["schema_version"], CALC_BATCH_REQUEST_SCHEMA_VERSION)
+        self.assertEqual(len(payload["requests"]), 2)
+
     def test_run_damage_calc_requires_node(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -57,17 +73,61 @@ class DamageCalcTest(unittest.TestCase):
             root = Path(temp_dir)
             (root / "tools").mkdir()
             (root / "tools" / "damage-calc-cli.cjs").write_text("", encoding="utf-8")
+            (root / "tools" / "damage-calc-worker.cjs").write_text("", encoding="utf-8")
             (root / "node_modules" / "@smogon" / "calc").mkdir(parents=True)
 
             with (
                 mock.patch("pokerena.calc.shutil.which", return_value="/usr/bin/node"),
                 mock.patch(
-                    "pokerena.calc.subprocess.run",
-                    side_effect=subprocess.TimeoutExpired(cmd=["node"], timeout=1),
+                    "pokerena.calc._ensure_calc_worker",
+                    return_value=root / ".runtime" / "calc" / "worker.sock",
+                ),
+                mock.patch(
+                    "pokerena.calc._send_worker_request",
+                    side_effect=TimeoutError("Timed out waiting for calc worker response."),
                 ),
             ):
                 with self.assertRaisesRegex(ConfigError, "timed out"):
                     run_damage_calc(sample_damage_calc_payload(), project_root=root, timeout_seconds=1)
+
+    def test_send_worker_request_enforces_hard_deadline_after_partial_response(self) -> None:
+        class _FakeSocket:
+            def __init__(self, *args, **kwargs) -> None:
+                self.recv_calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def settimeout(self, value) -> None:
+                self.timeout = value
+
+            def connect(self, path) -> None:
+                self.path = path
+
+            def sendall(self, message) -> None:
+                self.message = message
+
+            def shutdown(self, how) -> None:
+                self.how = how
+
+            def recv(self, size) -> bytes:
+                self.recv_calls += 1
+                if self.recv_calls == 1:
+                    return b"{"
+                raise socket.timeout("still waiting")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "worker.sock"
+            socket_path.write_text("", encoding="utf-8")
+            with (
+                mock.patch("pokerena.calc.socket.socket", _FakeSocket),
+                mock.patch("pokerena.calc.time.monotonic", side_effect=[0.0, 0.0, 0.1, 0.2, 1.5]),
+            ):
+                with self.assertRaisesRegex(TimeoutError, "Timed out waiting for calc worker response"):
+                    _send_worker_request(socket_path, {"command": "ping"}, timeout_seconds=1)
 
     def test_calc_damage_command_reads_file_input_from_nested_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -107,6 +167,22 @@ class DamageCalcTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn('"max": 20', buffer.getvalue())
+
+    def test_calc_damage_batch_command_reads_stdin_input(self) -> None:
+        payload = json.dumps(sample_damage_calc_batch_payload())
+
+        with (
+            mock.patch(
+                "pokerena.cli.run_damage_calc_batch",
+                return_value={"schema_version": "pokerena.damage-batch-result.v1", "results": [{"range": {"min": 10, "max": 20}}]},
+            ),
+            mock.patch("sys.stdin", new=StringIO(payload)),
+            mock.patch("sys.stdout", new=StringIO()) as buffer,
+        ):
+            code = main(["calc", "damage-batch", "--stdin"])
+
+        self.assertEqual(code, 0)
+        self.assertIn('"schema_version": "pokerena.damage-batch-result.v1"', buffer.getvalue())
 
     def test_doctor_reports_missing_calc_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -268,3 +344,14 @@ class DamageCalcTest(unittest.TestCase):
         self.assertEqual(result["range"], {"min": 165, "max": 195})
         self.assertEqual(result["range_percent"], {"min": 43.08, "max": 50.91})
         self.assertEqual(result["knockout"]["text"], "guaranteed 3HKO after Leftovers recovery")
+
+    def test_run_damage_calc_batch_preserves_input_order(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        if not (repo_root / "node_modules" / "@smogon" / "calc").exists():
+            self.skipTest("@smogon/calc is unavailable")
+
+        result = run_damage_calc_batch(sample_damage_calc_batch_payload(), project_root=repo_root)
+
+        self.assertEqual(result["schema_version"], "pokerena.damage-batch-result.v1")
+        self.assertEqual([item["status"] for item in result["results"]], ["ok", "ok"])
+        self.assertEqual([item["move_name"] for item in result["results"]], ["Double-Edge", "Earthquake"])

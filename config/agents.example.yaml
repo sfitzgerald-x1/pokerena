@@ -1,11 +1,11 @@
 agents:
   - id: example-randbat-bot
     enabled: false
-    provider: codex
+    provider: example-provider
     player_slot: p1
     format_allowlist:
-      - gen9randombattle
-    transport: sim-stream
+      - gen3randombattle
+    transport: showdown-client
     launch:
       command: python3.14
       args:
@@ -17,4 +17,12 @@ agents:
       context_format: pokerena.turn-context.v1
       decision_format: pokerena.decision.v1
       prompt_style: showdown-turn-v1
+      history_turn_limit: 4
+      decision_timeout_seconds: 120
     env_file: .env
+    callable:
+      enabled: false
+      username: LocalAgentBot
+      accepted_formats:
+        - gen3randombattle
+      challenge_policy: accept-direct-challenges

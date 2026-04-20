@@ -6,23 +6,37 @@ from importlib import resources
 import json
 import os
 from pathlib import Path
+import queue
+import random
+import re
 import subprocess
-from typing import Any, Deque, Dict, List, Optional, Protocol
+import threading
+import time
+from typing import Any, Callable, Deque, Dict, List, Optional, Protocol
+import unicodedata
+from urllib.parse import urlsplit, urlunsplit
 
 from jsonschema import Draft202012Validator
 
+from .calc import (
+    CALC_BATCH_REQUEST_SCHEMA_VERSION,
+    CALC_REQUEST_SCHEMA_VERSION,
+    CALC_SUPPORT_SUPPORTED_DAMAGING,
+    CALC_SUPPORT_SUPPORTED_NON_DAMAGING,
+    CALC_SUPPORT_UNSUPPORTED,
+    classify_move_support,
+)
 from .config import AgentDefinition, ConfigError, ServerConfig, _parse_dotenv
+from .runtime_env import filtered_runtime_env
 
 
 TURN_CONTEXT_SCHEMA_VERSION = "pokerena.turn-context.v1"
 DECISION_SCHEMA_VERSION = "pokerena.decision.v1"
 CAPTURE_SCHEMA_VERSION = "pokerena.battle-capture.v1"
-
-
 @dataclass(frozen=True)
 class DecisionPolicy:
     max_invalid_retries: int = 3
-    decision_timeout_seconds: int = 45
+    decision_timeout_seconds: int = 120
     history_limit: int = 60
     fallback_policy: str = "first-legal"
 
@@ -73,6 +87,14 @@ class AgentDecision:
     raw_output: str
 
 
+class AgentTimeoutError(ConfigError):
+    """Raised when a hook subprocess times out before producing a decision."""
+
+
+class AgentCancelledError(ConfigError):
+    """Raised when Pokerena cancels a hook subprocess before it returns."""
+
+
 @dataclass(frozen=True)
 class AgentInvocationArtifacts:
     context_path: Path
@@ -80,6 +102,15 @@ class AgentInvocationArtifacts:
     response_path: Optional[Path]
     capture_path: Optional[Path]
     cursor_path: Path
+    usage: Optional[Dict[str, Any]] = None
+    duration_ms: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class HookProcessResult:
+    stdout_text: str
+    usage: Optional[Dict[str, Any]]
+    duration_ms: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -89,10 +120,22 @@ class BattleCapture:
     events: List[SessionEvent]
 
 
+@dataclass(frozen=True)
+class PreparedTurnPrompt:
+    text: str
+    trace_messages: List[str]
+
+
+@dataclass
+class PublicTurnBlock:
+    turn_number: Optional[int]
+    lines: List[str]
+
+
 class Adapter(Protocol):
     def connect(self) -> None: ...
 
-    def next_event(self) -> SessionEvent: ...
+    def next_event(self, timeout: Optional[float] = None) -> SessionEvent: ...
 
     def submit_decision(self, *, player_slot: str, choice: str, rqid: Optional[str]) -> None: ...
 
@@ -113,7 +156,7 @@ class BattleSession:
         self.history_limit = history_limit
         self.best_effort_reprime = best_effort_reprime
         self.events: List[SessionEvent] = []
-        self.public_history: Deque[str] = deque(maxlen=history_limit)
+        self.public_turns: Deque[PublicTurnBlock] = deque(maxlen=max(1, history_limit + 1))
         self.format_name: Optional[str] = None
         self.turn_number: Optional[int] = None
         self.phase = "setup"
@@ -186,7 +229,7 @@ class BattleSession:
             request=request,
             side=side,
             active=[item for item in active if isinstance(item, dict)],
-            recent_public_events=list(self.public_history),
+            recent_public_events=self._recent_public_events(agent.hook.history_turn_limit),
             last_error=self.last_error,
         )
         return context
@@ -211,30 +254,38 @@ class BattleSession:
         for line in lines:
             if not line:
                 continue
-            self.public_history.append(line)
             if line.startswith("|tier|"):
+                self._append_public_line(line, self.turn_number)
                 _, _, value = line.partition("|tier|")
                 self.format_name = value or self.format_name
             elif line.startswith("|turn|"):
                 _, _, value = line.partition("|turn|")
                 try:
-                    self.turn_number = int(value)
+                    next_turn = int(value)
                 except ValueError as error:
                     raise ConfigError(f"Invalid turn marker: {line}") from error
+                self.turn_number = next_turn
+                self._append_public_line(line, next_turn)
                 self.phase = "turn"
             elif line == "|teampreview":
+                self._append_public_line(line, self.turn_number)
                 self.phase = "team-preview"
             elif line == "|upkeep":
+                self._append_public_line(line, self.turn_number)
                 self.phase = "upkeep"
             elif line.startswith("|win|") or line == "|tie":
+                self._append_public_line(line, self.turn_number)
                 self.finished = True
                 self.phase = "finished"
+            else:
+                self._append_public_line(line, self.turn_number)
 
     def _ingest_request(self, payload: Dict[str, Any]) -> None:
         self.current_request = payload
         self.current_request_kind = determine_request_kind(payload, finished=self.finished)
         self.phase = determine_phase(self.current_request_kind, self.turn_number, finished=self.finished)
-        self.last_error = None
+        if not payload.get("update"):
+            self.last_error = None
         self.current_request_turn_number = self.turn_number
         if not self.waiting_for_decision:
             return
@@ -257,6 +308,26 @@ class BattleSession:
         if self.current_rqid is None:
             return
         self.invalid_attempts_by_rqid[self.current_rqid] = self.invalid_attempts_by_rqid.get(self.current_rqid, 0) + 1
+
+    def _append_public_line(self, line: str, turn_number: Optional[int]) -> None:
+        if not self.public_turns or self.public_turns[-1].turn_number != turn_number:
+            self.public_turns.append(PublicTurnBlock(turn_number=turn_number, lines=[]))
+        self.public_turns[-1].lines.append(line)
+
+    def _recent_public_events(self, turn_limit: int) -> List[str]:
+        if self.turn_number is None:
+            return [line for block in self.public_turns for line in block.lines]
+
+        lowest_turn = max(1, self.turn_number - turn_limit + 1)
+        recent_lines: List[str] = []
+        for block in self.public_turns:
+            if block.turn_number is None:
+                if lowest_turn == 1:
+                    recent_lines.extend(block.lines)
+                continue
+            if block.turn_number >= lowest_turn:
+                recent_lines.extend(block.lines)
+        return recent_lines
 
 
 class SimStreamAdapter:
@@ -299,7 +370,8 @@ class SimStreamAdapter:
             player_spec = {"name": self.player_names[player_slot]}
             self._write_line(f">player {player_slot} {json.dumps(player_spec, separators=(',', ':'))}")
 
-    def next_event(self) -> SessionEvent:
+    def next_event(self, timeout: Optional[float] = None) -> SessionEvent:
+        _ = timeout
         while not self.pending_events:
             chunk = self._read_chunk()
             self.pending_events.extend(self._parse_chunk(chunk))
@@ -392,22 +464,355 @@ class SimStreamAdapter:
 
 
 class ShowdownClientAdapter:
-    def __init__(self) -> None:
-        self.enabled = False
+    def __init__(
+        self,
+        *,
+        server_config: ServerConfig,
+        agent: AgentDefinition,
+    ) -> None:
+        self.server_config = server_config
+        self.agent = agent
+        self.connection = None
+        self.pending_events: Deque[SessionEvent] = deque()
+        self.authenticated = False
+        self.current_battle_id: Optional[str] = None
+        self.pending_challenger: Optional[str] = None
+        self.pending_format: Optional[str] = None
+        self._warned_malformed_frames: set[str] = set()
 
     def connect(self) -> None:
-        raise ConfigError(
-            "The showdown-client adapter is defined but not implemented yet. Use the local sim-stream transport for now."
-        )
+        if not self.agent.callable.enabled:
+            raise ConfigError(
+                f"Agent {self.agent.agent_id!r} is not callable. Set callable.enabled: true to expose it on the local server."
+            )
+        if not self.agent.callable.username:
+            raise ConfigError(
+                f"Agent {self.agent.agent_id!r} must set callable.username for the showdown-client transport."
+            )
+        if not self.server_config.no_security:
+            raise ConfigError(
+                "Callable local agents require no_security: true so the bot can rename without checked-in credentials."
+            )
 
-    def next_event(self) -> SessionEvent:
-        raise ConfigError("The showdown-client adapter is not implemented yet.")
+        try:
+            from websockets.sync.client import connect as websocket_connect
+        except ImportError as error:
+            raise ConfigError(
+                "The Python websockets dependency is missing. Reinstall the Pokerena package to enable showdown-client."
+            ) from error
+
+        self.connection = websocket_connect(self.websocket_url(), open_timeout=10, close_timeout=5)
+        while not self.authenticated:
+            payload = self._recv_text()
+            self.pending_events.extend(self._consume_message(payload))
+
+    def next_event(self, timeout: Optional[float] = None) -> SessionEvent:
+        while not self.pending_events:
+            self.pending_events.extend(self._consume_message(self._recv_text(timeout=timeout)))
+        return self.pending_events.popleft()
 
     def submit_decision(self, *, player_slot: str, choice: str, rqid: Optional[str]) -> None:
-        raise ConfigError("The showdown-client adapter is not implemented yet.")
+        if player_slot != self.agent.player_slot:
+            raise ConfigError(
+                f"Showdown client only supports local decisions for {self.agent.player_slot}; got {player_slot}."
+            )
+        if not self.current_battle_id:
+            raise ConfigError("No active battle room is available for /choose.")
+        suffix = f"|{rqid}" if rqid else ""
+        self._send(self.current_battle_id, f"/choose {choice}{suffix}")
+
+    def forfeit_current_battle(self) -> None:
+        if not self.current_battle_id:
+            raise ConfigError("No active battle room is available for /forfeit.")
+        self._send(self.current_battle_id, "/forfeit")
 
     def close(self) -> None:
+        if self.connection is None:
+            return
+        self.connection.close()
+        self.connection = None
         return
+
+    def websocket_url(self) -> str:
+        parts = urlsplit(self.server_config.public_origin)
+        if parts.scheme not in {"http", "https", "ws", "wss"}:
+            raise ConfigError(
+                f"Unsupported public_origin scheme {parts.scheme!r}; expected http(s) for the local Showdown server."
+            )
+        scheme = "wss" if parts.scheme in {"https", "wss"} else "ws"
+        path = parts.path.rstrip("/")
+        websocket_path = f"{path}/showdown/websocket" if path else "/showdown/websocket"
+        return urlunsplit((scheme, parts.netloc, websocket_path, "", ""))
+
+    def _recv_text(self, timeout: Optional[float] = None) -> str:
+        if self.connection is None:
+            raise ConfigError("The showdown-client adapter is not connected.")
+        try:
+            payload = self.connection.recv(timeout=timeout)
+        except TimeoutError:
+            raise
+        except Exception as error:
+            raise ConfigError(f"Showdown websocket receive failed: {error}") from error
+        if payload is None:
+            raise ConfigError("Showdown websocket closed unexpectedly.")
+        if not isinstance(payload, str):
+            raise ConfigError("Showdown websocket returned a non-text frame.")
+        return payload
+
+    def _send(self, room_id: str, text: str) -> None:
+        if self.connection is None:
+            raise ConfigError("The showdown-client adapter is not connected.")
+        try:
+            self.connection.send(f"{room_id}|{text}")
+        except Exception as error:
+            raise ConfigError(f"Showdown websocket send failed: {error}") from error
+
+    def _send_global(self, text: str) -> None:
+        self._send("", text)
+
+    def _consume_message(self, payload: str) -> List[SessionEvent]:
+        events: List[SessionEvent] = []
+        for room_id, lines in _split_protocol_message(payload):
+            if room_id is None:
+                events.extend(self._consume_global_lines(lines))
+            elif room_id.startswith("battle-"):
+                events.extend(self._consume_battle_room(room_id, lines))
+        return events
+
+    def _consume_global_lines(self, lines: List[str]) -> List[SessionEvent]:
+        events: List[SessionEvent] = []
+        for line in lines:
+            if line.startswith("|challstr|"):
+                self._send_global(f"/trn {self.agent.callable.username}")
+                continue
+            if line.startswith("|updateuser|"):
+                warning = self._handle_updateuser(line)
+                if warning is not None:
+                    events.append(warning)
+                continue
+            if line.startswith("|nametaken|"):
+                warning = self._handle_nametaken(line)
+                if warning is not None:
+                    events.append(warning)
+                continue
+            if line.startswith("|pm|"):
+                self._handle_pm(line)
+                continue
+            if line.startswith("|updatechallenges|"):
+                warning = self._handle_updatechallenges(line)
+                if warning is not None:
+                    events.append(warning)
+                continue
+            if line.startswith("|popup|"):
+                events.append(
+                    SessionEvent(
+                        event_type="client_notice",
+                        battle_id=self.current_battle_id or "global",
+                        payload={"message": line[len("|popup|") :]},
+                    )
+                )
+        return events
+
+    def _handle_pm(self, line: str) -> None:
+        parts = line.split("|", 4)
+        if len(parts) < 5:
+            return
+        sender = _user_id(parts[2])
+        message = parts[4]
+        if not message.startswith("/challenge "):
+            return
+        challenge_details = message[len("/challenge ") :]
+        challenge_format, _, _ = challenge_details.partition("|")
+        if challenge_format:
+            self._handle_incoming_challenge(sender, challenge_format)
+
+    def _handle_updateuser(self, line: str) -> Optional[SessionEvent]:
+        parts = line.split("|", 5)
+        if len(parts) < 5:
+            return self._warn_malformed_frame_once(
+                "updateuser-short",
+                f"Ignored malformed Showdown |updateuser| frame: {line}",
+            )
+        user = parts[2]
+        named = parts[3] == "1"
+        avatar = parts[4] if len(parts) > 4 else ""
+        if _user_id(user) != _user_id(self.agent.callable.username or ""):
+            return None
+        if not named:
+            raise ConfigError(
+                f"Showdown reported {self.agent.callable.username!r} without a stable local rename."
+            )
+        self.authenticated = True
+        if self.agent.callable.avatar and avatar != self.agent.callable.avatar:
+            self._send_global(f"/avatar {self.agent.callable.avatar}")
+        return None
+
+    def _handle_nametaken(self, line: str) -> Optional[SessionEvent]:
+        parts = line.split("|", 3)
+        if len(parts) < 4:
+            return self._warn_malformed_frame_once(
+                "nametaken-short",
+                f"Ignored malformed Showdown |nametaken| frame: {line}",
+            )
+        username = parts[2]
+        message = parts[3]
+        if _user_id(username) == _user_id(self.agent.callable.username or ""):
+            raise ConfigError(
+                f"Callable bot username {self.agent.callable.username!r} is unavailable: {message}"
+            )
+        return None
+
+    def _handle_updatechallenges(self, line: str) -> Optional[SessionEvent]:
+        try:
+            payload = json.loads(line[len("|updatechallenges|") :])
+        except json.JSONDecodeError:
+            return self._warn_malformed_frame_once(
+                "updatechallenges-json",
+                f"Ignored malformed Showdown |updatechallenges| frame: {line}",
+            )
+        if not isinstance(payload, dict):
+            return self._warn_malformed_frame_once(
+                "updatechallenges-shape",
+                "Ignored malformed Showdown |updatechallenges| payload because it was not a JSON object.",
+            )
+        challenges = payload.get("challengesFrom", {})
+        if not isinstance(challenges, dict):
+            return self._warn_malformed_frame_once(
+                "updatechallenges-challengesFrom",
+                "Ignored malformed Showdown |updatechallenges| payload because challengesFrom was not an object.",
+            )
+        if self.pending_challenger and self.pending_challenger not in challenges:
+            self.pending_challenger = None
+            self.pending_format = None
+        for challenger, challenge_format in challenges.items():
+            if not isinstance(challenger, str) or not isinstance(challenge_format, str):
+                continue
+            self._handle_incoming_challenge(challenger, challenge_format)
+        return None
+
+    def _handle_incoming_challenge(self, challenger: str, challenge_format: str) -> None:
+        if self.agent.callable.challenge_policy != "accept-direct-challenges":
+            self._reject_challenge(challenger, "This bot is not accepting challenges right now.")
+            return
+        normalized_format = challenge_format.strip().lower()
+        accepted_formats = {item.lower() for item in self.agent.callable.accepted_formats}
+        if self.current_battle_id is not None or (
+            self.pending_challenger is not None and self.pending_challenger != challenger
+        ):
+            self._reject_challenge(challenger, "I'm already in another battle.")
+            return
+        if normalized_format not in accepted_formats:
+            allowed = ", ".join(self.agent.callable.accepted_formats) or "none"
+            self._reject_challenge(challenger, f"I only accept these formats: {allowed}.")
+            return
+        if self.pending_challenger == challenger and self.pending_format == normalized_format:
+            return
+        self._send_global("/utm null")
+        self._send_global(f"/accept {challenger}")
+        self.pending_challenger = challenger
+        self.pending_format = normalized_format
+
+    def _reject_challenge(self, challenger: str, message: str) -> None:
+        self._send_global(f"/pm {challenger}, {message}")
+        self._send_global(f"/reject {challenger}")
+
+    def _warn_malformed_frame_once(self, key: str, message: str) -> Optional[SessionEvent]:
+        if key in self._warned_malformed_frames:
+            return None
+        self._warned_malformed_frames.add(key)
+        return SessionEvent(
+            event_type="client_notice",
+            battle_id=self.current_battle_id or "global",
+            payload={"message": message},
+        )
+
+    def _consume_battle_room(self, room_id: str, lines: List[str]) -> List[SessionEvent]:
+        if self.current_battle_id and room_id != self.current_battle_id:
+            self._send(room_id, "/forfeit")
+            return [
+                SessionEvent(
+                    event_type="client_notice",
+                    battle_id=room_id,
+                    payload={
+                        "message": (
+                            "Forfeited an unexpected second battle room because callable local agents only support one active battle at a time."
+                        )
+                    },
+                )
+            ]
+
+        events: List[SessionEvent] = []
+        if self.current_battle_id != room_id:
+            self.current_battle_id = room_id
+            events.append(
+                SessionEvent(
+                    event_type="battle_started",
+                    battle_id=room_id,
+                    payload={
+                        "challenger": self.pending_challenger,
+                        "format": self.pending_format,
+                    },
+                )
+            )
+
+        public_lines: List[str] = []
+        request_events: List[SessionEvent] = []
+        rejection_events: List[SessionEvent] = []
+        battle_finished_payload: Optional[Dict[str, Any]] = None
+        for line in lines:
+            if line == "|deinit":
+                continue
+            if line.startswith("|request|"):
+                payload = json.loads(line[len("|request|") :])
+                if not isinstance(payload, dict):
+                    raise ConfigError(f"Invalid request payload in battle room {room_id}.")
+                request_events.append(
+                    SessionEvent(
+                        event_type="request_received",
+                        battle_id=room_id,
+                        player_slot=self.agent.player_slot,
+                        payload=payload,
+                    )
+                )
+                continue
+            if line.startswith("|error|"):
+                rejection_events.append(
+                    SessionEvent(
+                        event_type="choice_rejected",
+                        battle_id=room_id,
+                        player_slot=self.agent.player_slot,
+                        payload={"message": line[len("|error|") :]},
+                    )
+                )
+                continue
+            public_lines.append(line)
+            if line.startswith("|win|"):
+                battle_finished_payload = {"winner": line[len("|win|") :]}
+            elif line == "|tie":
+                battle_finished_payload = {"tie": True}
+
+        if public_lines:
+            events.append(
+                SessionEvent(
+                    event_type="public_update",
+                    battle_id=room_id,
+                    payload={"lines": public_lines},
+                )
+            )
+        events.extend(request_events)
+        events.extend(rejection_events)
+        if battle_finished_payload is not None:
+            events.append(
+                SessionEvent(
+                    event_type="battle_finished",
+                    battle_id=room_id,
+                    payload=battle_finished_payload,
+                )
+            )
+            self.current_battle_id = None
+            self.pending_challenger = None
+            self.pending_format = None
+        return events
 
 
 def find_agent(agents: List[AgentDefinition], agent_id: str) -> AgentDefinition:
@@ -525,28 +930,362 @@ def build_session_from_capture(
     return session
 
 
-def render_turn_prompt(agent: AgentDefinition, context: TurnContext) -> str:
+def prepare_turn_prompt(
+    agent: AgentDefinition,
+    context: TurnContext,
+    *,
+    project_root: Optional[Path] = None,
+) -> PreparedTurnPrompt:
     context_json = json.dumps(asdict(context), indent=2, sort_keys=True)
-    return "\n".join(
+    sections = [
+        "You are a Pokemon Showdown battle agent running inside Pokerena.",
+        f"Provider label: {agent.provider}.",
+        "Use the JSON turn context as the source of truth.",
+        "Forward legality from the request payload itself; do not invent actions outside it.",
+        "Return JSON only with this shape:",
+        json.dumps(
+            {
+                "schema_version": agent.hook.decision_format,
+                "decision": "move 1",
+                "notes": "short explanation",
+            }
+        ),
+        "If no action is required, return `wait`.",
+    ]
+    switch_section = _voluntary_switch_prompt_section(context)
+    if switch_section:
+        sections.extend(["", switch_section])
+    calc_section, trace_messages = _damage_calc_section(context, project_root=project_root)
+    if calc_section:
+        sections.extend(["", calc_section])
+    sections.extend(
         [
-            "You are a Pokemon Showdown battle agent running inside Pokerena.",
-            f"Provider label: {agent.provider}.",
-            "Use the JSON turn context as the source of truth.",
-            "Forward legality from the request payload itself; do not invent actions outside it.",
-            "Return JSON only with this shape:",
-            json.dumps(
-                {
-                    "schema_version": agent.hook.decision_format,
-                    "decision": "move 1",
-                    "notes": "short explanation",
-                }
-            ),
-            "If no action is required, return `wait`.",
             "",
             "TURN CONTEXT JSON",
             context_json,
         ]
     )
+    return PreparedTurnPrompt(text="\n".join(sections), trace_messages=trace_messages)
+
+
+def render_turn_prompt(
+    agent: AgentDefinition,
+    context: TurnContext,
+    *,
+    project_root: Optional[Path] = None,
+) -> str:
+    return prepare_turn_prompt(agent, context, project_root=project_root).text
+
+
+def _voluntary_switch_prompt_section(context: TurnContext) -> str:
+    if context.request_kind != "move":
+        return ""
+    switch_hints = [hint for hint in context.legal_action_hints if isinstance(hint, str) and hint.startswith("switch ")]
+    if not switch_hints:
+        return ""
+    return "\n".join(
+        [
+            "VOLUNTARY SWITCHING",
+            "This is a normal move turn, and switching is also legal here.",
+            "Before locking in a move, also consider whether pivoting to a teammate improves the board position.",
+            "If the request payload shows that you are trapped, treat switching as unavailable.",
+            f"Available switch commands: {', '.join(f'`{hint}`' for hint in switch_hints)}",
+        ]
+    )
+
+
+def _damage_calc_section(
+    context: TurnContext,
+    project_root: Optional[Path] = None,
+) -> tuple[str, List[str]]:
+    if context.request_kind != "move":
+        return "", []
+
+    calc_plan = _build_damage_calc_batch_plan(context, project_root=project_root)
+    if calc_plan is None:
+        return "\n".join(
+            [
+                "DAMAGE CALC WORKFLOW",
+                "Use `python3.14 -m pokerena calc damage-batch --stdin` when you have enough observable information to compare legal move candidates.",
+                "For obviously non-damaging/status moves, reason heuristically instead of forcing a calc.",
+            ]
+        ), []
+
+    move_labels = list(calc_plan["move_labels"])
+    skipped_moves = list(calc_plan["skipped_moves"])
+    batch_payload = calc_plan.get("batch_payload")
+    lines = [
+        "DAMAGE CALC WORKFLOW",
+        "On this turn you may either attack or switch.",
+        "If you plan to attack, run one Pokerena damage batch for the supported damaging move candidates below.",
+    ]
+    if skipped_moves:
+        lines.extend(["", "Skip these moves in damage calc and reason heuristically:"])
+        for skipped in skipped_moves:
+            lines.append(f"- {skipped['label']} — {skipped['reason']}")
+    if not batch_payload:
+        lines.extend(
+            [
+                "",
+                "No supported damaging move candidates remain for the calc tool on this turn.",
+                "If attacking looks bad, consider whether switching is the better play.",
+            ]
+        )
+        return "\n".join(lines), list(calc_plan["trace_messages"])
+
+    lines.extend(
+        [
+            "For clearly non-damaging/status moves, reason heuristically instead of forcing a calc.",
+            "Use this command exactly:",
+            "`python3.14 -m pokerena calc damage-batch --stdin`",
+            "",
+            "Move order:",
+        ]
+    )
+    for index, label in enumerate(move_labels, start=1):
+        lines.append(f"{index}. {label}")
+    lines.extend(
+        [
+            "",
+            "Ready-to-run batch request:",
+            "```json",
+            json.dumps(batch_payload, indent=2, sort_keys=True),
+            "```",
+        ]
+    )
+    return "\n".join(lines), list(calc_plan["trace_messages"])
+
+
+def _build_damage_calc_batch_plan(
+    context: TurnContext,
+    *,
+    project_root: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    generation = _extract_generation(context)
+    attacker = _active_side_pokemon(context.side)
+    defender = _active_opponent_from_public_history(context)
+    active_request = context.active[0] if len(context.active) == 1 and isinstance(context.active[0], dict) else None
+    if generation is None or attacker is None or defender is None or active_request is None:
+        return None
+
+    requests: List[Dict[str, Any]] = []
+    move_labels: List[str] = []
+    skipped_moves: List[Dict[str, str]] = []
+    trace_messages: List[str] = []
+    moves = active_request.get("moves", [])
+    if not isinstance(moves, list):
+        return None
+    for move_index, move in enumerate(moves, start=1):
+        if not isinstance(move, dict) or move.get("disabled", False):
+            continue
+        move_name = str(move.get("move") or "").strip()
+        if not move_name:
+            continue
+        label = f"Move {move_index} · {move_name}"
+        support = _classify_move_for_prompt(
+            move=move,
+            generation=generation,
+            move_name=move_name,
+            project_root=project_root,
+        )
+        if support["classification"] != CALC_SUPPORT_SUPPORTED_DAMAGING:
+            skipped_moves.append(
+                {
+                    "label": label,
+                    "reason": _calc_skip_reason_text(support["classification"]),
+                }
+            )
+            trace_messages.append(
+                f"Skipping calc preflight for {label}: {_calc_trace_reason_text(support)}."
+            )
+            continue
+        requests.append(
+            {
+                "schema_version": CALC_REQUEST_SCHEMA_VERSION,
+                "generation": generation,
+                "attacker": attacker,
+                "defender": defender,
+                "move": {"name": move_name},
+                "field": {},
+            }
+        )
+        move_labels.append(label)
+    return {
+        "batch_payload": (
+            {
+                "schema_version": CALC_BATCH_REQUEST_SCHEMA_VERSION,
+                "requests": requests,
+            }
+            if requests
+            else None
+        ),
+        "move_labels": move_labels,
+        "skipped_moves": skipped_moves,
+        "trace_messages": trace_messages,
+    }
+
+
+def _classify_move_for_prompt(
+    *,
+    move: Dict[str, Any],
+    generation: int,
+    move_name: str,
+    project_root: Optional[Path],
+) -> Dict[str, str]:
+    if project_root is not None:
+        try:
+            return classify_move_support(
+                project_root=project_root,
+                generation=generation,
+                move_name=move_name,
+            )
+        except ConfigError:
+            pass
+    if _move_is_probably_non_damaging(move):
+        return {
+            "classification": CALC_SUPPORT_SUPPORTED_NON_DAMAGING,
+            "source": "heuristic",
+        }
+    return {
+        "classification": CALC_SUPPORT_SUPPORTED_DAMAGING,
+        "source": "heuristic",
+    }
+
+
+def _move_is_probably_non_damaging(move: Dict[str, Any]) -> bool:
+    category = move.get("category")
+    if isinstance(category, str) and category.strip().lower() == "status":
+        return True
+    base_power = move.get("basePower")
+    if isinstance(base_power, int):
+        return base_power == 0
+    return False
+
+
+def _calc_skip_reason_text(classification: str) -> str:
+    if classification == CALC_SUPPORT_SUPPORTED_NON_DAMAGING:
+        return "non-damaging/status move; reason heuristically."
+    return "unsupported by the local calc tool; do not retry this calc."
+
+
+def _calc_trace_reason_text(support: Dict[str, str]) -> str:
+    source = str(support.get("source") or "preflight")
+    classification = support["classification"]
+    if classification == CALC_SUPPORT_SUPPORTED_NON_DAMAGING:
+        return f"classified as non-damaging/status via {source}"
+    return f"classified as unsupported via {source}"
+
+
+def _extract_generation(context: TurnContext) -> Optional[int]:
+    if context.format_name:
+        match = re.search(r"\[Gen (\d+)\]", context.format_name)
+        if match:
+            return int(match.group(1))
+    for line in context.recent_public_events:
+        if not isinstance(line, str) or not line.startswith("|gen|"):
+            continue
+        _, _, value = line.partition("|gen|")
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return None
+
+
+def _active_side_pokemon(side: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(side, dict):
+        return None
+    pokemon = side.get("pokemon", [])
+    if not isinstance(pokemon, list):
+        return None
+    for candidate in pokemon:
+        if not isinstance(candidate, dict) or not candidate.get("active"):
+            continue
+        species = _pokemon_species(candidate)
+        if not species:
+            return None
+        payload: Dict[str, Any] = {"species": species}
+        options: Dict[str, Any] = {}
+        level = _pokemon_level(candidate)
+        if level is not None:
+            options["level"] = level
+        stats = candidate.get("stats")
+        if isinstance(stats, dict) and stats:
+            options["stats"] = stats
+        item = candidate.get("item")
+        if isinstance(item, str) and item.strip():
+            options["item"] = item.strip()
+        ability = candidate.get("baseAbility")
+        if isinstance(ability, str) and ability.strip():
+            options["ability"] = ability.strip()
+        if options:
+            payload["options"] = options
+        return payload
+    return None
+
+
+def _active_opponent_from_public_history(context: TurnContext) -> Optional[Dict[str, Any]]:
+    opponent_prefix = "p2" if context.player_slot == "p1" else "p1"
+    for line in reversed(context.recent_public_events):
+        if not isinstance(line, str):
+            continue
+        parts = line.split("|")
+        if len(parts) < 4 or parts[1] not in {"switch", "drag", "replace"}:
+            continue
+        ident = parts[2]
+        if not isinstance(ident, str) or not ident.startswith(f"{opponent_prefix}"):
+            continue
+        details = parts[3] if len(parts) > 3 else ""
+        species = _species_from_details(details) or _species_from_ident(ident)
+        if not species:
+            return None
+        payload: Dict[str, Any] = {"species": species}
+        options: Dict[str, Any] = {}
+        level = _level_from_details(details)
+        if level is not None:
+            options["level"] = level
+        if options:
+            payload["options"] = options
+        return payload
+    return None
+
+
+def _pokemon_species(pokemon: Dict[str, Any]) -> Optional[str]:
+    details = pokemon.get("details")
+    if isinstance(details, str):
+        species = _species_from_details(details)
+        if species:
+            return species
+    ident = pokemon.get("ident")
+    if isinstance(ident, str):
+        return _species_from_ident(ident)
+    return None
+
+
+def _pokemon_level(pokemon: Dict[str, Any]) -> Optional[int]:
+    details = pokemon.get("details")
+    if isinstance(details, str):
+        return _level_from_details(details)
+    return None
+
+
+def _species_from_details(details: str) -> Optional[str]:
+    value = details.split(",", 1)[0].strip()
+    return value or None
+
+
+def _level_from_details(details: str) -> Optional[int]:
+    match = re.search(r"\bL(\d+)\b", details)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _species_from_ident(ident: str) -> Optional[str]:
+    if ":" not in ident:
+        return ident.strip() or None
+    value = ident.split(":", 1)[1].strip()
+    return value or None
 
 
 def invoke_agent(
@@ -557,6 +1296,9 @@ def invoke_agent(
     capture_path: Optional[Path],
     dry_run: bool,
     timeout_seconds: int,
+    prompt_text: Optional[str] = None,
+    trace_sink: Optional[Callable[..., None]] = None,
+    cancel_check: Optional[Callable[[], Optional[str]]] = None,
 ) -> tuple[Optional[AgentDecision], AgentInvocationArtifacts]:
     agent_runtime_dir = runtime_root / "agents" / agent.agent_id / context.battle_id
     agent_runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -569,7 +1311,12 @@ def invoke_agent(
     context_payload = asdict(context)
     _validate_schema("turn-context.v1.json", context_payload)
     context_path.write_text(json.dumps(context_payload, indent=2) + "\n", encoding="utf-8")
-    prompt_path.write_text(render_turn_prompt(agent, context), encoding="utf-8")
+    resolved_prompt_text = prompt_text or render_turn_prompt(
+        agent,
+        context,
+        project_root=runtime_root.parent,
+    )
+    prompt_path.write_text(resolved_prompt_text, encoding="utf-8")
 
     artifacts = AgentInvocationArtifacts(
         context_path=context_path,
@@ -581,37 +1328,331 @@ def invoke_agent(
     if dry_run:
         return None, artifacts
 
-    env = os.environ.copy()
+    env = filtered_runtime_env()
     if agent.env_file and agent.env_file.exists():
         env.update(_parse_dotenv(agent.env_file))
     env["POKERENA_TURN_CONTEXT_PATH"] = str(context_path)
     env["POKERENA_TURN_PROMPT_PATH"] = str(prompt_path)
+    env["POKERENA_TRANSCRIPT_PATH"] = str(agent_runtime_dir / "transcript.json")
+    env["POKERENA_REQUEST_SEQUENCE"] = str(context.request_sequence)
+    env["POKERENA_DECISION_ATTEMPT"] = str(context.decision_attempt)
     if capture_path is not None:
         env["POKERENA_BATTLE_CAPTURE_PATH"] = str(capture_path)
 
-    try:
-        completed = subprocess.run(
-            [agent.launch.command, *agent.launch.args],
-            input=prompt_path.read_text(encoding="utf-8"),
-            text=True,
-            capture_output=True,
-            cwd=agent.launch.cwd,
-            env=env,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise ConfigError(
-            f"Agent hook command timed out after {timeout_seconds} seconds."
-        ) from error
+    command, claude_streaming = _hook_command(agent)
+    hook_result = _run_hook_process(
+        command=command,
+        cwd=agent.launch.cwd,
+        env=env,
+        prompt_text=prompt_path.read_text(encoding="utf-8"),
+        timeout_seconds=timeout_seconds,
+        expected_schema=agent.hook.decision_format,
+        claude_streaming=claude_streaming,
+        trace_sink=trace_sink,
+        cancel_check=cancel_check,
+    )
 
-    if completed.returncode != 0:
-        raise ConfigError(
-            f"Agent hook command exited with code {completed.returncode}: {completed.stderr.strip() or completed.stdout.strip()}"
-        )
-
-    decision = parse_decision_output(completed.stdout, agent.hook.decision_format)
+    decision = parse_decision_output(hook_result.stdout_text, agent.hook.decision_format)
     response_path.write_text(json.dumps(asdict(decision), indent=2) + "\n", encoding="utf-8")
-    return decision, artifacts
+    return decision, AgentInvocationArtifacts(
+        context_path=artifacts.context_path,
+        prompt_path=artifacts.prompt_path,
+        response_path=artifacts.response_path,
+        capture_path=artifacts.capture_path,
+        cursor_path=artifacts.cursor_path,
+        usage=hook_result.usage,
+        duration_ms=hook_result.duration_ms,
+    )
+
+
+def _hook_command(agent: AgentDefinition) -> tuple[List[str], bool]:
+    command = [agent.launch.command, *agent.launch.args]
+    executable = Path(agent.launch.command).name.lower()
+    if executable != "claude":
+        return command, False
+
+    filtered: List[str] = []
+    skip_next = False
+    for index, arg in enumerate(agent.launch.args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--output-format":
+            skip_next = True
+            continue
+        if arg in {"--include-partial-messages", "--verbose"}:
+            continue
+        filtered.append(arg)
+        if arg == "-p":
+            continue
+        if arg == "--print":
+            continue
+        if arg == "--model" and index + 1 < len(agent.launch.args):
+            filtered.append(agent.launch.args[index + 1])
+            skip_next = True
+    if "-p" not in filtered and "--print" not in filtered:
+        filtered.insert(0, "-p")
+    filtered.extend(["--output-format", "stream-json", "--include-partial-messages", "--verbose"])
+    return [agent.launch.command, *filtered], True
+
+
+def _run_hook_process(
+    *,
+    command: List[str],
+    cwd: Path,
+    env: Dict[str, str],
+    prompt_text: str,
+    timeout_seconds: int,
+    expected_schema: str,
+    claude_streaming: bool,
+    trace_sink: Optional[Callable[..., None]],
+    cancel_check: Optional[Callable[[], Optional[str]]],
+) -> HookProcessResult:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        env=env,
+        bufsize=1,
+    )
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        raise ConfigError("Agent hook subprocess did not expose stdio pipes.")
+    process.stdin.write(prompt_text)
+    process.stdin.close()
+
+    if trace_sink is not None:
+        trace_sink("status", f"Hook started: {' '.join(command)}")
+
+    event_queue: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
+    reader_threads = [
+        threading.Thread(
+            target=_stream_reader,
+            args=(process.stdout, "stdout", event_queue),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_stream_reader,
+            args=(process.stderr, "stderr", event_queue),
+            daemon=True,
+        ),
+    ]
+    for thread in reader_threads:
+        thread.start()
+
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    stdout_done = False
+    stderr_done = False
+    parser = _ClaudeStreamParser(trace_sink=trace_sink) if claude_streaming else None
+    deadline = time.monotonic() + timeout_seconds
+
+    try:
+        while True:
+            if stdout_done and stderr_done and process.poll() is not None:
+                break
+            cancel_reason = cancel_check() if cancel_check is not None else None
+            if cancel_reason and process.poll() is None:
+                _terminate_process(process)
+                raise AgentCancelledError(cancel_reason)
+            if time.monotonic() >= deadline and process.poll() is None:
+                _terminate_process(process)
+                raise AgentTimeoutError(
+                    f"Agent hook command timed out after {timeout_seconds} seconds."
+                )
+            try:
+                source, line = event_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                if source == "stdout":
+                    stdout_done = True
+                else:
+                    stderr_done = True
+                continue
+            if source == "stdout":
+                stdout_chunks.append(line)
+                if parser is not None:
+                    parser.consume(line.rstrip("\n"))
+                elif trace_sink is not None and line.strip():
+                    trace_sink("agent", line)
+            else:
+                stderr_chunks.append(line)
+                if trace_sink is not None and line.strip():
+                    trace_sink("status", f"stderr: {line.rstrip()}")
+    finally:
+        for thread in reader_threads:
+            thread.join(timeout=1)
+
+    return_code = process.wait()
+    if process.stdout is not None and not process.stdout.closed:
+        process.stdout.close()
+    if process.stderr is not None and not process.stderr.closed:
+        process.stderr.close()
+    stderr_text = "".join(stderr_chunks).strip()
+    stdout_text = "".join(stdout_chunks).strip()
+    if return_code != 0:
+        raise ConfigError(
+            f"Agent hook command exited with code {return_code}: {stderr_text or stdout_text}"
+        )
+    if parser is not None:
+        final_output = parser.final_output()
+        if final_output:
+            return HookProcessResult(
+                stdout_text=final_output,
+                usage=parser.usage,
+                duration_ms=parser.duration_ms,
+            )
+    return HookProcessResult(stdout_text=stdout_text, usage=None, duration_ms=None)
+
+
+def _stream_reader(
+    stream: Any,
+    source: str,
+    output: "queue.Queue[tuple[str, Optional[str]]]",
+) -> None:
+    try:
+        for line in stream:
+            output.put((source, line))
+    finally:
+        output.put((source, None))
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+class _ClaudeStreamParser:
+    def __init__(self, *, trace_sink: Optional[Callable[..., None]]) -> None:
+        self.trace_sink = trace_sink
+        self.partial_text: List[str] = []
+        self.assistant_output = ""
+        self.result_output = ""
+        self.usage: Optional[Dict[str, Any]] = None
+        self.duration_ms: Optional[int] = None
+
+    def consume(self, line: str) -> None:
+        if not line.strip():
+            return
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            if self.trace_sink is not None:
+                self.trace_sink("agent", line + "\n")
+            return
+        if not isinstance(payload, dict):
+            return
+
+        payload_type = payload.get("type")
+        if payload_type == "stream_event":
+            event = payload.get("event")
+            if not isinstance(event, dict):
+                return
+            event_type = event.get("type")
+            if event_type == "content_block_delta":
+                delta = event.get("delta")
+                if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                    text = str(delta.get("text") or "")
+                    if text:
+                        self.partial_text.append(text)
+                        if self.trace_sink is not None:
+                            self.trace_sink("agent", text)
+                return
+            if event_type == "content_block_start":
+                content_block = event.get("content_block")
+                if isinstance(content_block, dict) and content_block.get("type") == "tool_use":
+                    tool_name = str(content_block.get("name") or "tool")
+                    if self.trace_sink is not None:
+                        self.trace_sink(
+                            "status",
+                            f"Claude using tool: {tool_name}",
+                            actor_kind="helper",
+                            actor_name=tool_name,
+                        )
+                return
+            if event_type == "message_delta":
+                self._update_usage(event.get("usage"))
+                return
+            return
+
+        if payload_type == "assistant":
+            message = payload.get("message")
+            if not isinstance(message, dict):
+                return
+            self._update_usage(message.get("usage"))
+            content = message.get("content")
+            if not isinstance(content, list):
+                return
+            texts = []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                text = str(block.get("text") or "")
+                if text:
+                    texts.append(text)
+            if texts:
+                self.assistant_output = "".join(texts)
+            return
+
+        if payload_type == "result":
+            result = payload.get("result")
+            if isinstance(result, str) and result.strip():
+                self.result_output = result.strip()
+            self._update_usage(payload.get("usage"))
+            duration_ms = payload.get("duration_ms")
+            if isinstance(duration_ms, int):
+                self.duration_ms = duration_ms
+
+    def final_output(self) -> str:
+        for candidate in (self.result_output, self.assistant_output, "".join(self.partial_text).strip()):
+            if candidate:
+                return candidate
+        return ""
+
+    def _update_usage(self, usage: Any) -> None:
+        normalized = _normalize_usage_payload(usage)
+        if normalized is not None:
+            self.usage = normalized
+
+
+def _normalize_usage_payload(usage: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _usage_int(usage.get("input_tokens"))
+    output_tokens = _usage_int(usage.get("output_tokens"))
+    cache_read_tokens = _usage_int(usage.get("cache_read_input_tokens"))
+    cache_creation_tokens = _usage_int(usage.get("cache_creation_input_tokens"))
+    total_tokens = sum(
+        value
+        for value in (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+        if value is not None
+    )
+    normalized: Dict[str, Any] = {"provider": "claude"}
+    if input_tokens is not None:
+        normalized["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        normalized["output_tokens"] = output_tokens
+    if cache_read_tokens is not None:
+        normalized["cache_read_input_tokens"] = cache_read_tokens
+    if cache_creation_tokens is not None:
+        normalized["cache_creation_input_tokens"] = cache_creation_tokens
+    normalized["total_tokens"] = total_tokens
+    return normalized
+
+
+def _usage_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def parse_decision_output(stdout: str, expected_schema: str) -> AgentDecision:
@@ -622,14 +1663,16 @@ def parse_decision_output(stdout: str, expected_schema: str) -> AgentDecision:
     try:
         parsed = json.loads(payload)
     except json.JSONDecodeError:
-        decision = AgentDecision(
-            schema_version=expected_schema,
-            decision=payload.splitlines()[0].strip(),
-            notes="",
-            raw_output=payload,
-        )
-        _validate_schema("decision.v1.json", asdict(decision))
-        return decision
+        parsed = _extract_embedded_decision_json(payload)
+        if parsed is None:
+            decision = AgentDecision(
+                schema_version=expected_schema,
+                decision=payload.splitlines()[0].strip(),
+                notes="",
+                raw_output=payload,
+            )
+            _validate_schema("decision.v1.json", asdict(decision))
+            return decision
 
     if not isinstance(parsed, dict):
         raise ConfigError("Agent hook must return a JSON object or a plain-text decision string.")
@@ -645,6 +1688,92 @@ def parse_decision_output(stdout: str, expected_schema: str) -> AgentDecision:
     )
     _validate_schema("decision.v1.json", asdict(decision))
     return decision
+
+
+def _extract_embedded_decision_json(payload: str) -> Optional[Dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    candidates: List[Dict[str, Any]] = []
+    for index, char in enumerate(payload):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(payload[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            decision_text = parsed.get("decision")
+            if isinstance(decision_text, str) and decision_text.strip():
+                candidates.append(parsed)
+    if not candidates:
+        return None
+    return candidates[-1]
+
+
+def choose_random_legal(
+    request: Optional[Dict[str, Any]],
+    *,
+    rng: Optional[random.Random] = None,
+) -> str:
+    chooser = rng or random
+    if not request:
+        return "wait"
+    if request.get("wait"):
+        return "wait"
+    if request.get("teamPreview"):
+        side = request.get("side")
+        pokemon = side.get("pokemon", []) if isinstance(side, dict) else []
+        indexes = [str(index) for index in range(1, len(pokemon) + 1)]
+        if not indexes:
+            return "wait"
+        chooser.shuffle(indexes)
+        return f"team {''.join(indexes)}"
+
+    force_switch = request.get("forceSwitch")
+    if isinstance(force_switch, list) and any(bool(slot) for slot in force_switch):
+        side = request.get("side")
+        pokemon = side.get("pokemon", []) if isinstance(side, dict) else []
+        available = [
+            index + 1
+            for index, slot in enumerate(pokemon)
+            if isinstance(slot, dict) and _can_switch_to(slot)
+        ]
+        if not available:
+            return "pass"
+        chooser.shuffle(available)
+        choices: List[str] = []
+        available_pool = list(available)
+        for needed in force_switch:
+            if not needed:
+                choices.append("pass")
+                continue
+            if not available_pool:
+                choices.append("pass")
+                continue
+            target = available_pool.pop()
+            choices.append(f"switch {target}")
+        return ", ".join(choices)
+
+    active = request.get("active")
+    if isinstance(active, list) and active:
+        voluntary_switch_choices = _voluntary_switch_choices(request)
+        if len(active) == 1 and isinstance(active[0], dict):
+            move_choices = _enabled_moves(active[0])
+            choices = move_choices + voluntary_switch_choices
+            if choices:
+                return chooser.choice(choices)
+            return "pass"
+        choices = []
+        for slot in active:
+            if not isinstance(slot, dict):
+                choices.append("pass")
+                continue
+            move_choices = _enabled_moves(slot)
+            if not move_choices:
+                choices.append("pass")
+                continue
+            choices.append(chooser.choice(move_choices))
+        return ", ".join(choices)
+    return "wait"
 
 
 def choose_first_legal(request: Optional[Dict[str, Any]]) -> str:
@@ -690,11 +1819,11 @@ def choose_first_legal(request: Optional[Dict[str, Any]]) -> str:
             if not isinstance(slot, dict):
                 choices.append("pass")
                 continue
-            move = _first_enabled_move(slot)
-            if move is None:
+            move_choices = _enabled_moves(slot)
+            if not move_choices:
                 choices.append("pass")
                 continue
-            choices.append(move)
+            choices.append(move_choices[0])
         return ", ".join(choices)
     return "wait"
 
@@ -808,6 +1937,7 @@ def _legal_action_hints(request: Optional[Dict[str, Any]]) -> List[str]:
             for move_index, move in enumerate(active_slot.get("moves", []), start=1):
                 if isinstance(move, dict) and not move.get("disabled", False):
                     hints.append(f"move {move_index}")
+        hints.extend(_voluntary_switch_choices(request))
 
     if not hints:
         hints.append("wait")
@@ -815,13 +1945,19 @@ def _legal_action_hints(request: Optional[Dict[str, Any]]) -> List[str]:
 
 
 def _first_enabled_move(active_request: Dict[str, Any]) -> Optional[str]:
+    moves = _enabled_moves(active_request)
+    return moves[0] if moves else None
+
+
+def _enabled_moves(active_request: Dict[str, Any]) -> List[str]:
     moves = active_request.get("moves", [])
     if not isinstance(moves, list):
-        return None
+        return []
+    enabled: List[str] = []
     for index, move in enumerate(moves, start=1):
         if isinstance(move, dict) and not move.get("disabled", False):
-            return f"move {index}"
-    return None
+            enabled.append(f"move {index}")
+    return enabled
 
 
 def _can_switch_to(pokemon: Dict[str, Any]) -> bool:
@@ -829,6 +1965,28 @@ def _can_switch_to(pokemon: Dict[str, Any]) -> bool:
         return False
     condition = str(pokemon.get("condition") or "")
     return "fnt" not in condition
+
+
+def _voluntary_switch_choices(request: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(request, dict):
+        return []
+    if request.get("wait") or request.get("teamPreview"):
+        return []
+    force_switch = request.get("forceSwitch")
+    if isinstance(force_switch, list) and any(bool(slot) for slot in force_switch):
+        return []
+    active = request.get("active")
+    if not isinstance(active, list) or len(active) != 1 or not isinstance(active[0], dict):
+        return []
+    if active[0].get("trapped") is True:
+        return []
+    side = request.get("side")
+    pokemon = side.get("pokemon", []) if isinstance(side, dict) else []
+    choices: List[str] = []
+    for index, slot in enumerate(pokemon, start=1):
+        if isinstance(slot, dict) and _can_switch_to(slot):
+            choices.append(f"switch {index}")
+    return choices
 
 
 def _load_schema(name: str) -> Dict[str, Any]:
@@ -843,3 +2001,29 @@ def _validate_schema(name: str, payload: Dict[str, Any]) -> None:
         return
     message = "; ".join(error.message for error in errors[:3])
     raise ConfigError(f"{name} validation failed: {message}")
+
+
+def _split_protocol_message(payload: str) -> List[tuple[Optional[str], List[str]]]:
+    room_id: Optional[str] = None
+    current_lines: List[str] = []
+    blocks: List[tuple[Optional[str], List[str]]] = []
+    for raw_line in payload.splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            continue
+        if line.startswith(">"):
+            if current_lines:
+                blocks.append((room_id, current_lines))
+            room_id = line[1:] or None
+            current_lines = []
+            continue
+        current_lines.append(line)
+    if current_lines:
+        blocks.append((room_id, current_lines))
+    return blocks
+
+
+def _user_id(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).lower()
+    return "".join(character for character in normalized if character.isalnum())
+
