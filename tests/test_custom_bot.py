@@ -809,6 +809,70 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual(_status_base_value("frz", sleep_clause_active=False), 88.0)
         self.assertGreater(plan.actions[0].score, 70)
 
+    def test_reflect_is_zero_when_already_active(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Reflect", "id": "reflect", "disabled": False},
+            ],
+            own_species="Alakazam",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Alakazam|Alakazam, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|-start|p1a: Alakazam|Reflect",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Reflect": _metadata(
+                "Reflect",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                volatile_status="reflect",
+            ),
+        }
+        ranges = {"Tackle": (10, 12)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+
+    def test_barrier_is_zero_after_defense_boost_is_active(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Barrier", "id": "barrier", "disabled": False},
+            ],
+            own_species="Alakazam",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Alakazam|Alakazam, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|-boost|p1a: Alakazam|def|2",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Barrier": _metadata(
+                "Barrier",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"def": 2},
+            ),
+        }
+        ranges = {"Tackle": (10, 12)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+
     def test_switches_are_added_when_active_moves_are_weak(self) -> None:
         context = _context(
             [{"move": "Tackle", "id": "tackle", "disabled": False}],

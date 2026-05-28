@@ -171,6 +171,10 @@ def build_custom_bot_plan(
     opponent = _active_opponent_from_public_history(context, public_lines)
     if active_request is None or own_active is None or opponent is None:
         return _fallback_plan(request, "missing active Pokemon or opponent state", chooser)
+    own_active = _with_volatile_statuses(
+        own_active,
+        _volatile_statuses_for_active(public_lines, own_active.ident, own_active.volatile_statuses),
+    )
 
     root = project_root or detect_project_root()
     move_candidates = _move_candidates(
@@ -617,8 +621,12 @@ def _score_status_or_utility_move(
 
     move_id = _metadata_id(metadata)
     hp_fraction = own_active.hp_fraction if own_active.hp_fraction is not None else 1.0
+    if move_id == "reflect" and _has_volatile_status(own_active, "reflect"):
+        return 0.0, "Reflect already active"
     boosts = metadata.get("boosts")
     if isinstance(boosts, dict) and boosts:
+        if move_id == "barrier" and own_boosts.get("def", 0) > 0:
+            return 0.0, "Barrier already active"
         if move_id == "agility" and "spe" in boosts:
             score, reason = _agility_score(
                 own_active=own_active,
@@ -1151,6 +1159,23 @@ def _pokemon_state_from_side_slot(pokemon: Dict[str, Any]) -> PokemonState:
     )
 
 
+def _with_volatile_statuses(
+    pokemon: PokemonState,
+    volatile_statuses: Sequence[str],
+) -> PokemonState:
+    normalized = tuple(dict.fromkeys(_normalize_move_id(status) for status in volatile_statuses if status))
+    if normalized == pokemon.volatile_statuses:
+        return pokemon
+    return PokemonState(
+        species=pokemon.species,
+        ident=pokemon.ident,
+        calc_ref=pokemon.calc_ref,
+        hp_fraction=pokemon.hp_fraction,
+        status=pokemon.status,
+        volatile_statuses=normalized,
+    )
+
+
 def _active_opponent_from_public_history(
     context: Dict[str, Any],
     public_lines: Sequence[str],
@@ -1331,6 +1356,27 @@ def _boosts_for_active(
         if len(parts) >= 3 and parts[1] in {"-clearboost", "-clearallboost"} and _same_ident(parts[2], own_ident):
             boosts = {}
     return boosts
+
+
+def _volatile_statuses_for_active(
+    public_lines: Sequence[str],
+    own_ident: Optional[str],
+    initial: Sequence[str] = (),
+) -> tuple[str, ...]:
+    volatile_statuses = tuple(_normalize_move_id(status) for status in initial if status)
+    if not own_ident:
+        return volatile_statuses
+    for line in public_lines:
+        parts = line.split("|") if isinstance(line, str) else []
+        if len(parts) >= 4 and parts[1] in {"switch", "drag", "replace"} and _same_ident(parts[2], own_ident):
+            volatile_statuses = ()
+            continue
+        if len(parts) >= 4 and parts[1] == "-start" and _same_ident(parts[2], own_ident):
+            volatile_statuses = _add_volatile_status(volatile_statuses, parts[3])
+            continue
+        if len(parts) >= 4 and parts[1] == "-end" and _same_ident(parts[2], own_ident):
+            volatile_statuses = _remove_volatile_status(volatile_statuses, parts[3])
+    return volatile_statuses
 
 
 def _revealed_opponent_moves(context: Dict[str, Any], public_lines: Sequence[str]) -> List[str]:
