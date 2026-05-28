@@ -34,6 +34,7 @@ MAJOR_STATUSES = {"slp", "par", "psn", "tox", "brn", "frz"}
 SLEEP_MOVES = {"hypnosis", "lovelykiss", "sing", "sleeppowder", "spore"}
 CHARGE_MOVE_IDS = {"solarbeam", "skyattack", "skullbash"}
 BOOST_CAP = 6
+_POKEDEX_BASE_SPEED_CACHE: Dict[Path, Dict[str, int]] = {}
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,7 @@ def build_custom_bot_plan(
                 opponent=opponent,
                 own_boosts=own_boosts,
                 sleep_clause_active=sleep_clause_active,
+                project_root=root,
             )
         if score > 0:
             action_scores.append(_scored_action(candidate.choice, candidate.name, score, reason))
@@ -462,6 +464,7 @@ def _score_status_or_utility_move(
     opponent: PokemonState,
     own_boosts: Dict[str, int],
     sleep_clause_active: bool,
+    project_root: Path,
 ) -> tuple[float, str]:
     metadata = candidate.metadata
     status = str(metadata.get("status") or "")
@@ -476,6 +479,14 @@ def _score_status_or_utility_move(
     hp_fraction = own_active.hp_fraction if own_active.hp_fraction is not None else 1.0
     boosts = metadata.get("boosts")
     if isinstance(boosts, dict) and boosts:
+        if move_id == "agility" and "spe" in boosts:
+            return _agility_score(
+                own_active=own_active,
+                opponent=opponent,
+                own_boosts=own_boosts,
+                hp_fraction=hp_fraction,
+                project_root=project_root,
+            )
         score = _boost_score(move_id, boosts, hp_fraction, own_boosts)
         return score, "setup boost"
 
@@ -524,6 +535,39 @@ def _boost_score(
     if "evasion" in boosts:
         return 75.0 * hp_fraction if hp_fraction >= 0.40 else 18.0 * hp_fraction
     return 35.0 * hp_fraction
+
+
+def _agility_score(
+    *,
+    own_active: PokemonState,
+    opponent: PokemonState,
+    own_boosts: Dict[str, int],
+    hp_fraction: float,
+    project_root: Path,
+) -> tuple[float, str]:
+    if own_boosts.get("spe", 0) > 0:
+        return 0.0, "Agility already boosted Speed"
+    if own_active.status == "par":
+        if hp_fraction >= 0.35:
+            return 92.0 * max(hp_fraction, 0.55), "Agility offsets Gen 1 paralysis Speed loss"
+        return 30.0 * hp_fraction, "Agility offsets paralysis but user is low HP"
+
+    own_speed = _known_speed_stat(own_active)
+    opponent_speed = _estimated_gen1_speed(opponent, project_root)
+    if own_speed is None or opponent_speed is None:
+        if hp_fraction >= 0.70:
+            return 22.0 * hp_fraction, "Agility with unknown Speed matchup"
+        if hp_fraction >= 0.45:
+            return 12.0 * hp_fraction, "Agility with unknown Speed matchup"
+        return 3.0 * hp_fraction, "Agility with unknown Speed matchup"
+
+    if own_speed >= opponent_speed:
+        return 0.0, "already likely faster"
+    if hp_fraction >= 0.75:
+        return 72.0 * hp_fraction, "Agility to outspeed likely faster opponent"
+    if hp_fraction >= 0.45:
+        return 38.0 * hp_fraction, "Agility to outspeed likely faster opponent"
+    return 8.0 * hp_fraction, "Agility too risky at low HP"
 
 
 def _boosts_are_capped(boosts: Dict[str, Any], own_boosts: Dict[str, int]) -> bool:
@@ -926,6 +970,68 @@ def _accuracy_factor(metadata: Dict[str, Any]) -> float:
     if isinstance(accuracy, (int, float)):
         return max(0.0, min(1.0, float(accuracy) / 100.0))
     return 1.0
+
+
+def _known_speed_stat(pokemon: PokemonState) -> Optional[int]:
+    options = pokemon.calc_ref.get("options") if isinstance(pokemon.calc_ref, dict) else None
+    stats = options.get("stats") if isinstance(options, dict) else None
+    if not isinstance(stats, dict):
+        return None
+    speed = _int_value(stats.get("spe"), 0)
+    return speed if speed > 0 else None
+
+
+def _estimated_gen1_speed(pokemon: PokemonState, project_root: Path) -> Optional[int]:
+    known_speed = _known_speed_stat(pokemon)
+    if known_speed is not None:
+        return known_speed
+    base_speed = _base_speed_for_species(pokemon.species, project_root)
+    if base_speed is None:
+        return None
+    level = _calc_ref_level(pokemon.calc_ref) or 100
+    return int(((((base_speed + 15) * 2 + 63) * level) // 100) + 5)
+
+
+def _base_speed_for_species(species: str, project_root: Path) -> Optional[int]:
+    try:
+        root = project_root.resolve()
+    except OSError:
+        root = project_root
+    if root not in _POKEDEX_BASE_SPEED_CACHE:
+        _POKEDEX_BASE_SPEED_CACHE[root] = _load_pokedex_base_spe(root)
+    return _POKEDEX_BASE_SPEED_CACHE[root].get(_normalize_move_id(species))
+
+
+def _load_pokedex_base_spe(project_root: Path) -> Dict[str, int]:
+    for relative_path in (
+        Path("vendor/pokemon-showdown/dist/data/pokedex.js"),
+        Path("vendor/pokemon-showdown/data/pokedex.ts"),
+    ):
+        path = project_root / relative_path
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        speeds: Dict[str, int] = {}
+        pattern = re.compile(
+            r"^\s*([a-z0-9]+):\s*\{.*?baseStats:\s*\{[^}]*\bspe:\s*(\d+)",
+            re.MULTILINE | re.DOTALL,
+        )
+        for match in pattern.finditer(text):
+            speeds[match.group(1)] = int(match.group(2))
+        if speeds:
+            return speeds
+    return {}
+
+
+def _calc_ref_level(calc_ref: Dict[str, Any]) -> Optional[int]:
+    options = calc_ref.get("options") if isinstance(calc_ref, dict) else None
+    if not isinstance(options, dict):
+        return None
+    level = _int_value(options.get("level"), 0)
+    return level if level > 0 else None
 
 
 def _metadata_id(metadata: Dict[str, Any]) -> str:

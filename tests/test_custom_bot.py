@@ -290,6 +290,104 @@ class CustomBotTest(unittest.TestCase):
         self.assertGreater(high_plan.actions[0].score, 70)
         self.assertLess(low_plan.actions[0].score, 5)
 
+    def test_agility_scores_zero_when_already_faster(self) -> None:
+        context = _context(
+            [{"move": "Agility", "id": "agility", "disabled": False}],
+            own_stats={"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 220},
+        )
+        metadata = {
+            "Agility": _metadata(
+                "Agility",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"spe": 2},
+            )
+        }
+
+        with _patched_calc(metadata, {}), mock.patch(
+            "pokerena.custom_bot._estimated_gen1_speed",
+            return_value=160,
+        ):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual(plan.actions, [])
+        self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
+
+    def test_agility_scores_high_when_slower_at_high_hp(self) -> None:
+        context = _context(
+            [{"move": "Agility", "id": "agility", "disabled": False}],
+            own_stats={"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 120},
+        )
+        metadata = {
+            "Agility": _metadata(
+                "Agility",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"spe": 2},
+            )
+        }
+
+        with _patched_calc(metadata, {}), mock.patch(
+            "pokerena.custom_bot._estimated_gen1_speed",
+            return_value=180,
+        ):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertGreater(plan.actions[0].score, 70)
+        self.assertIn("outspeed likely faster opponent", plan.actions[0].reason)
+
+    def test_agility_offsets_paralysis_until_speed_boost_lands(self) -> None:
+        paralyzed_context = _context(
+            [{"move": "Agility", "id": "agility", "disabled": False}],
+            own_species="Jolteon",
+            active_condition="80/100 par",
+            own_stats={"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 240},
+        )
+        boosted_context = _context(
+            [{"move": "Agility", "id": "agility", "disabled": False}],
+            own_species="Jolteon",
+            active_condition="80/100 par",
+            own_stats={"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 240},
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Jolteon|Jolteon, L80|80/100 par",
+                "|switch|p2a: Snorlax|Snorlax, L80|100/100",
+                "|-boost|p1a: Jolteon|spe|2",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Agility": _metadata(
+                "Agility",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"spe": 2},
+            )
+        }
+
+        with _patched_calc(metadata, {}), mock.patch(
+            "pokerena.custom_bot._estimated_gen1_speed",
+            return_value=120,
+        ):
+            paralyzed_plan = build_custom_bot_plan(
+                paralyzed_context,
+                project_root=Path.cwd(),
+                rng=random.Random(7),
+            )
+            boosted_plan = build_custom_bot_plan(
+                boosted_context,
+                project_root=Path.cwd(),
+                rng=random.Random(7),
+            )
+
+        self.assertGreater(paralyzed_plan.actions[0].score, 70)
+        self.assertIn("paralysis Speed loss", paralyzed_plan.actions[0].reason)
+        self.assertEqual(boosted_plan.actions, [])
+        self.assertEqual(boosted_plan.fallback_reason, "all heuristic scores were zero")
+
     def test_freeze_and_evasion_are_high_value_in_gen1(self) -> None:
         context = _context(
             [{"move": "Double Team", "id": "doubleteam", "disabled": False}],
@@ -446,6 +544,7 @@ def _context(
     own_species: str = "Venusaur",
     opponent_species: str = "Starmie",
     active_condition: str = "100/100",
+    own_stats: dict | None = None,
     bench: list[dict] | None = None,
     recent_public_events: list[str] | None = None,
 ) -> dict:
@@ -455,7 +554,8 @@ def _context(
             "details": f"{own_species}, L80",
             "condition": active_condition,
             "active": True,
-            "stats": {"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 180},
+            "stats": own_stats
+            or {"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 180},
         }
     ]
     side_pokemon.extend(bench or [])
