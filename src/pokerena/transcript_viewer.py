@@ -870,18 +870,29 @@ _INDEX_HTML = """<!doctype html>
         const key = node.dataset.traceKey;
         if (!key) return;
         const atBottom = node.scrollTop + node.clientHeight >= node.scrollHeight - 12;
-        tracePaneState.set(key, {scrollTop: node.scrollTop, atBottom});
+        const shell = node.closest(".trace-shell");
+        tracePaneState.set(key, {
+          scrollTop: node.scrollTop,
+          atBottom,
+          expanded: shell ? !shell.classList.contains("collapsed") : true,
+        });
       });
     }
 
     function restoreTracePaneState(group, node, battle) {
       const key = turnKey(battle.agent_id, battle.battle_id, group.requestSequence);
       const state = tracePaneState.get(key);
-      if (!state || state.atBottom || group.latest.turn_state === "thinking") {
-        node.scrollTop = node.scrollHeight;
-        return;
-      }
-      node.scrollTop = state.scrollTop;
+      const isThinking = group.latest.turn_state === "thinking";
+      const shouldAutoFollow = isThinking && (!state || state.atBottom);
+      const targetScrollTop = shouldAutoFollow ? null : (state ? state.scrollTop : node.scrollTop);
+      window.requestAnimationFrame(() => {
+        if (!node.isConnected) return;
+        if (shouldAutoFollow) {
+          node.scrollTop = node.scrollHeight;
+          return;
+        }
+        node.scrollTop = targetScrollTop;
+      });
     }
 
     function renderHeroActions(battle) {

@@ -4,7 +4,12 @@ const fs = require('fs');
 const net = require('net');
 const path = require('path');
 
-const {calculateDamage, calculateDamageBatch, classifyMoveSupport} = require('./damage-calc-lib.cjs');
+const {
+  calculateDamage,
+  calculateDamageBatch,
+  classifyMoveSupport,
+  describeMoveMetadataBatch,
+} = require('./damage-calc-lib.cjs');
 const WORKER_PROTOCOL_VERSION = 'pokerena.calc-worker.v1';
 
 function fail(message) {
@@ -38,7 +43,7 @@ function handleRequest(request) {
       result: {
         pong: true,
         protocol_version: WORKER_PROTOCOL_VERSION,
-        commands: ['ping', 'damage', 'damage-batch', 'classify-move'],
+        commands: ['ping', 'damage', 'damage-batch', 'classify-move', 'move-metadata-batch'],
       },
     };
   }
@@ -50,6 +55,9 @@ function handleRequest(request) {
   }
   if (request.command === 'classify-move') {
     return {ok: true, result: classifyMoveSupport(request.payload)};
+  }
+  if (request.command === 'move-metadata-batch') {
+    return {ok: true, result: describeMoveMetadataBatch(request.payload)};
   }
   throw new Error(`Unsupported worker command: ${String(request.command)}`);
 }

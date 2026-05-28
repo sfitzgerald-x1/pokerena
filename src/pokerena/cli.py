@@ -52,6 +52,7 @@ from .calc import (
     sample_damage_calc_payload,
 )
 from .config import ConfigError, load_agents_config, load_server_config
+from .custom_bot import decide_custom_bot_from_files, emit_custom_bot_decision
 from .runtime_env import filtered_runtime_env
 from .showdown import build_server_command, node_version, prepare_runtime
 from .transcript import (
@@ -127,6 +128,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return run_agent_context(args)
             if args.agent_command == "decide":
                 return run_agent_decide(args)
+            if args.agent_command == "custom-bot":
+                return run_agent_custom_bot(args)
             if args.agent_command == "sim-battle":
                 return run_agent_sim_battle(args)
             if args.agent_command == "showdown-client":
@@ -241,6 +244,32 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="How long to wait for the agent subprocess before treating it as timed out.",
+    )
+
+    custom_bot_parser = agent_subparsers.add_parser(
+        "custom-bot",
+        help="Run Pokerena's built-in Gen 1 random battle custom bot hook.",
+    )
+    custom_bot_parser.add_argument(
+        "--context",
+        default=None,
+        help="Path to turn-context JSON. Defaults to POKERENA_TURN_CONTEXT_PATH.",
+    )
+    custom_bot_parser.add_argument(
+        "--capture",
+        default=None,
+        help="Optional path to battle-capture JSON. Defaults to POKERENA_BATTLE_CAPTURE_PATH.",
+    )
+    custom_bot_parser.add_argument(
+        "--seed",
+        default=None,
+        help="Optional seed for deterministic weighted-random decisions.",
+    )
+    custom_bot_parser.add_argument(
+        "--calc-timeout",
+        type=int,
+        default=DEFAULT_CALC_TIMEOUT_SECONDS,
+        help="How long to wait for local calc worker damage and move metadata requests.",
     )
 
     sim_parser = agent_subparsers.add_parser(
@@ -637,6 +666,18 @@ def run_agent_decide(args: argparse.Namespace) -> int:
     save_cursor(cursor_path, session.advance_cursor())
     print(f"Response: {artifacts.response_path}")
     print(json.dumps(asdict(decision), indent=2))
+    return 0
+
+
+def run_agent_custom_bot(args: argparse.Namespace) -> int:
+    decision = decide_custom_bot_from_files(
+        context_path=args.context,
+        capture_path=args.capture,
+        seed=args.seed,
+        project_root=detect_project_root(),
+        calc_timeout_seconds=args.calc_timeout,
+    )
+    emit_custom_bot_decision(decision)
     return 0
 
 

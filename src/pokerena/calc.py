@@ -31,6 +31,8 @@ CALC_BATCH_REQUEST_SCHEMA_VERSION = "pokerena.damage-batch-request.v1"
 CALC_BATCH_RESULT_SCHEMA_VERSION = "pokerena.damage-batch-result.v1"
 CALC_SUPPORT_RESULT_SCHEMA_VERSION = "pokerena.damage-support.v1"
 CALC_SUPPORT_CACHE_SCHEMA_VERSION = "pokerena.damage-support-cache.v1"
+CALC_MOVE_METADATA_REQUEST_SCHEMA_VERSION = "pokerena.move-metadata-request.v1"
+CALC_MOVE_METADATA_RESULT_SCHEMA_VERSION = "pokerena.move-metadata-result.v1"
 CALC_WORKER_PROTOCOL_VERSION = "pokerena.calc-worker.v1"
 CALC_SUPPORT_SUPPORTED_DAMAGING = "supported_damaging"
 CALC_SUPPORT_SUPPORTED_NON_DAMAGING = "supported_non_damaging"
@@ -285,6 +287,33 @@ def classify_move_support(
         classification=result["classification"],
     )
     return {**result, "source": "preflight"}
+
+
+def describe_move_metadata(
+    *,
+    project_root: Path,
+    generation: int,
+    move_names: List[str],
+    timeout_seconds: int = DEFAULT_CALC_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    _ensure_calc_environment(project_root)
+    _require_positive_int(generation, "generation")
+    normalized_names = [str(name).strip() for name in move_names if str(name).strip()]
+    if not normalized_names:
+        raise ConfigError("move_names must include at least one move.")
+    response = _worker_request(
+        command="move-metadata-batch",
+        payload={
+            "schema_version": CALC_MOVE_METADATA_REQUEST_SCHEMA_VERSION,
+            "generation": generation,
+            "moves": normalized_names,
+            "project_root": str(project_root),
+        },
+        project_root=project_root,
+        timeout_seconds=timeout_seconds,
+        summary=f"metadata lookup for {len(normalized_names)} gen {generation} move(s)",
+    )
+    return _validate_move_metadata_result(response, generation=generation, expected_count=len(normalized_names))
 
 
 def detect_project_root(start: Optional[Path] = None) -> Path:
@@ -647,7 +676,7 @@ def _ping_worker(socket_path: Path) -> bool:
     if not isinstance(commands, list):
         return False
     command_set = {command for command in commands if isinstance(command, str)}
-    required_commands = {"damage", "damage-batch", "classify-move"}
+    required_commands = {"damage", "damage-batch", "classify-move", "move-metadata-batch"}
     return required_commands.issubset(command_set)
 
 
@@ -750,6 +779,63 @@ def _validate_damage_calc_request(payload: Dict[str, Any]) -> None:
     _require_named_object(payload.get("move"), "move", "name")
     _require_optional_object(payload.get("field"), "field")
     _validate_schema(CALC_REQUEST_SCHEMA_NAME, payload)
+
+
+def _validate_move_metadata_result(
+    result: Dict[str, Any],
+    *,
+    generation: int,
+    expected_count: int,
+) -> Dict[str, Any]:
+    if result.get("schema_version") != CALC_MOVE_METADATA_RESULT_SCHEMA_VERSION:
+        raise ConfigError(f"Move metadata result must declare {CALC_MOVE_METADATA_RESULT_SCHEMA_VERSION!r}.")
+    if result.get("generation") != generation:
+        raise ConfigError("Move metadata result generation did not match the request.")
+    moves = result.get("moves")
+    if not isinstance(moves, list) or len(moves) != expected_count:
+        raise ConfigError("Move metadata result must include one move entry per request.")
+    validated_moves: List[Dict[str, Any]] = []
+    for index, move in enumerate(moves):
+        if not isinstance(move, dict):
+            raise ConfigError(f"moves[{index}] must be a JSON object.")
+        name = move.get("name")
+        requested_name = move.get("requested_name")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"moves[{index}].name must be a non-empty string.")
+        if not isinstance(requested_name, str) or not requested_name.strip():
+            raise ConfigError(f"moves[{index}].requested_name must be a non-empty string.")
+        category = move.get("category")
+        if category not in {"Physical", "Special", "Status"}:
+            raise ConfigError(f"moves[{index}].category must be Physical, Special, or Status.")
+        base_power = move.get("base_power")
+        if isinstance(base_power, bool) or not isinstance(base_power, int) or base_power < 0:
+            raise ConfigError(f"moves[{index}].base_power must be a non-negative integer.")
+        accuracy = move.get("accuracy")
+        if accuracy is not True and (isinstance(accuracy, bool) or not isinstance(accuracy, int) or accuracy < 0):
+            raise ConfigError(f"moves[{index}].accuracy must be true or a non-negative integer.")
+        flags = move.get("flags")
+        boosts = move.get("boosts")
+        self_effect = move.get("self")
+        secondary = move.get("secondary")
+        validated_moves.append(
+            {
+                **move,
+                "requested_name": requested_name.strip(),
+                "name": name.strip(),
+                "flags": flags if isinstance(flags, dict) else {},
+                "boosts": boosts if isinstance(boosts, dict) else {},
+                "self": self_effect if isinstance(self_effect, dict) else {},
+                "secondary": secondary if isinstance(secondary, dict) else {},
+                "high_crit": bool(move.get("high_crit")),
+                "recharge": bool(move.get("recharge")),
+                "charge": bool(move.get("charge")),
+            }
+        )
+    return {
+        "schema_version": CALC_MOVE_METADATA_RESULT_SCHEMA_VERSION,
+        "generation": generation,
+        "moves": validated_moves,
+    }
 
 
 def _trace_calc_helper(message: str, *, actor_name: str) -> None:

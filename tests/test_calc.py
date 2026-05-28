@@ -15,6 +15,7 @@ from pokerena.calc import (
     CALC_REQUEST_SCHEMA_VERSION,
     _send_worker_request,
     detect_project_root,
+    describe_move_metadata,
     read_damage_calc_batch_input,
     read_damage_calc_input,
     run_damage_calc_batch,
@@ -89,6 +90,67 @@ class DamageCalcTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ConfigError, "timed out"):
                     run_damage_calc(sample_damage_calc_payload(), project_root=root, timeout_seconds=1)
+
+    def test_describe_move_metadata_uses_worker_result(self) -> None:
+        worker_result = {
+            "schema_version": "pokerena.move-metadata-result.v1",
+            "generation": 1,
+            "moves": [
+                {
+                    "requested_name": "Thunder Wave",
+                    "id": "thunderwave",
+                    "name": "Thunder Wave",
+                    "category": "Status",
+                    "base_power": 0,
+                    "accuracy": 100,
+                    "status": "par",
+                    "flags": {"reflectable": 1},
+                    "boosts": {},
+                    "self": {},
+                    "secondary": {},
+                    "high_crit": False,
+                    "recharge": False,
+                    "charge": False,
+                },
+                {
+                    "requested_name": "Slash",
+                    "id": "slash",
+                    "name": "Slash",
+                    "category": "Physical",
+                    "base_power": 70,
+                    "accuracy": 100,
+                    "status": None,
+                    "flags": {},
+                    "boosts": {},
+                    "self": {},
+                    "secondary": {},
+                    "high_crit": True,
+                    "recharge": False,
+                    "charge": False,
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tools").mkdir()
+            (root / "tools" / "damage-calc-cli.cjs").write_text("", encoding="utf-8")
+            (root / "tools" / "damage-calc-worker.cjs").write_text("", encoding="utf-8")
+            (root / "node_modules" / "@smogon" / "calc").mkdir(parents=True)
+            with (
+                mock.patch("pokerena.calc.shutil.which", return_value="/usr/bin/node"),
+                mock.patch("pokerena.calc._worker_request", return_value=worker_result) as worker,
+            ):
+                result = describe_move_metadata(
+                    project_root=root,
+                    generation=1,
+                    move_names=["Thunder Wave", "Slash"],
+                    timeout_seconds=2,
+                )
+
+        self.assertEqual(result["moves"][0]["status"], "par")
+        self.assertTrue(result["moves"][1]["high_crit"])
+        self.assertEqual(worker.call_args.kwargs["command"], "move-metadata-batch")
+        self.assertEqual(worker.call_args.kwargs["payload"]["project_root"], str(root))
 
     def test_send_worker_request_enforces_hard_deadline_after_partial_response(self) -> None:
         class _FakeSocket:

@@ -1,6 +1,9 @@
+const path = require('path');
+
 const {calculate, Field, Generations, Move, Pokemon} = require('@smogon/calc');
 
 const DAMAGE_SUPPORT_SCHEMA_VERSION = 'pokerena.damage-support.v1';
+const MOVE_METADATA_RESULT_SCHEMA_VERSION = 'pokerena.move-metadata-result.v1';
 
 function fail(message) {
   const error = new Error(message);
@@ -228,9 +231,88 @@ function calculateDamageBatch(payload) {
   };
 }
 
+function showdownDex(projectRoot) {
+  const root = projectRoot
+    ? path.resolve(projectRoot)
+    : path.resolve(__dirname, '..');
+  const showdownPath = path.join(root, 'vendor', 'pokemon-showdown');
+  try {
+    const {Dex} = require(showdownPath);
+    return Dex;
+  } catch (error) {
+    fail(
+      `Pokemon Showdown data is unavailable at ${showdownPath}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+}
+
+function plainObject(value) {
+  if (!value || Array.isArray(value) || typeof value !== 'object') {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => {
+      const valueType = typeof entry;
+      return entry === null || valueType === 'string' || valueType === 'number' || valueType === 'boolean';
+    })
+  );
+}
+
+function describeMoveMetadataBatch(payload) {
+  const data = requireObject(payload, 'payload');
+  if (data.schema_version !== 'pokerena.move-metadata-request.v1') {
+    fail("schema_version must be 'pokerena.move-metadata-request.v1'.");
+  }
+  const generation = data.generation;
+  requireGeneration(generation);
+  if (!Array.isArray(data.moves) || data.moves.length < 1) {
+    fail('moves must be a non-empty array.');
+  }
+  const projectRoot = data.project_root === undefined ? null : requireString(data.project_root, 'project_root');
+
+  const dex = showdownDex(projectRoot).mod(`gen${generation}`);
+  return {
+    schema_version: MOVE_METADATA_RESULT_SCHEMA_VERSION,
+    generation,
+    moves: data.moves.map(value => {
+      const requestedName = requireString(value, 'moves[]');
+      const move = dex.moves.get(requestedName);
+      if (!move.exists) {
+        fail(`Unknown move for gen ${generation}: ${requestedName}`);
+      }
+      const flags = plainObject(move.flags);
+      const self = plainObject(move.self);
+      const secondary = plainObject(move.secondary);
+      return {
+        requested_name: requestedName,
+        id: move.id,
+        name: move.name,
+        type: move.type,
+        category: move.category,
+        base_power: move.basePower,
+        accuracy: move.accuracy,
+        status: move.status || null,
+        volatile_status: move.volatileStatus || null,
+        boosts: plainObject(move.boosts),
+        self,
+        flags,
+        secondary,
+        crit_ratio: move.critRatio || 1,
+        high_crit: Number(move.critRatio || 1) > 1,
+        recharge: Boolean(flags.recharge) || self.volatileStatus === 'mustrecharge',
+        charge: Boolean(flags.charge),
+        target: move.target || null,
+      };
+    }),
+  };
+}
+
 module.exports = {
   calculateDamage,
   calculateDamageBatch,
   classifyMoveSupport,
+  describeMoveMetadataBatch,
   fail,
 };

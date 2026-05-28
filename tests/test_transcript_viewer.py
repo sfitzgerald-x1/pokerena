@@ -21,10 +21,16 @@ from pokerena.transcript import (
     upsert_battle_summary_entry,
     update_transcript_metadata,
 )
-from pokerena.transcript_viewer import _build_handler
+from pokerena.transcript_viewer import _INDEX_HTML, _build_handler
 
 
 class TranscriptViewerTest(unittest.TestCase):
+    def test_viewer_trace_scroll_restore_respects_user_position(self) -> None:
+        self.assertIn("shouldAutoFollow = isThinking && (!state || state.atBottom)", _INDEX_HTML)
+        self.assertIn("targetScrollTop = shouldAutoFollow ? null : (state ? state.scrollTop : node.scrollTop)", _INDEX_HTML)
+        self.assertIn("window.requestAnimationFrame", _INDEX_HTML)
+        self.assertNotIn('group.latest.turn_state === "thinking")', _INDEX_HTML)
+
     def test_viewer_endpoints_return_battle_summaries_and_transcripts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
