@@ -1264,15 +1264,22 @@ def _load_pokedex_entries(project_root: Path) -> Dict[str, Dict[str, Any]]:
         except OSError:
             continue
         entries: Dict[str, Dict[str, Any]] = {}
-        pattern = re.compile(
-            r"^\s*([a-z0-9]+):\s*\{.*?types:\s*\[([^\]]+)\].*?baseStats:\s*\{[^}]*\bspe:\s*(\d+)",
+        entry_pattern = re.compile(
+            r"^\s{2}([a-z0-9]+):\s*\{\n(.*?)(?=^\s{2}[a-z0-9]+:\s*\{|\n\};)",
             re.MULTILINE | re.DOTALL,
         )
-        for match in pattern.finditer(text):
-            entries[match.group(1)] = {
-                "types": re.findall(r'"([^"]+)"', match.group(2)),
-                "spe": int(match.group(3)),
-            }
+        for match in entry_pattern.finditer(text):
+            body = match.group(2)
+            types_match = re.search(r"types:\s*\[([^\]]+)\]", body)
+            speed_match = re.search(r"baseStats:\s*\{[^}]*\bspe:\s*(\d+)", body)
+            if types_match is None and speed_match is None:
+                continue
+            entry: Dict[str, Any] = {}
+            if types_match is not None:
+                entry["types"] = re.findall(r'"([^"]+)"', types_match.group(1))
+            if speed_match is not None:
+                entry["spe"] = int(speed_match.group(1))
+            entries[match.group(1)] = entry
         if entries:
             return entries
     return {}

@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
 from pokerena.config import ConfigError
 from pokerena.custom_bot import (
+    PokemonState,
+    _base_speed_for_species,
     _choose_weighted,
     _effective_player_slot,
+    _pokemon_types,
     _revealed_opponent_moves,
     _scored_action,
     _selection_pool,
@@ -208,14 +212,24 @@ class CustomBotTest(unittest.TestCase):
         }
         ranges = {"Tackle": (12, 15)}
 
-        with _patched_calc(metadata, ranges), mock.patch(
-            "pokerena.custom_bot._pokemon_types",
-            return_value=["Ground"],
-        ):
-            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(4))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            _write_pokedex_fixture(project_root)
+            with _patched_calc(metadata, ranges):
+                plan = build_custom_bot_plan(context, project_root=project_root, rng=random.Random(4))
 
         self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
         self.assertNotEqual(plan.decision, "move 2")
+
+    def test_pokedex_type_lookup_parses_showdown_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            _write_pokedex_fixture(project_root)
+
+            dugtrio = PokemonState("Dugtrio", None, {"species": "Dugtrio"}, 1.0, None)
+
+            self.assertEqual(_pokemon_types(dugtrio, project_root), ["Ground"])
+            self.assertEqual(_base_speed_for_species("Dugtrio", project_root), 120)
 
     def test_confuse_ray_scores_zero_when_target_already_confused(self) -> None:
         context = _context(
@@ -792,6 +806,32 @@ def _context(
         ],
         "last_error": None,
     }
+
+
+def _write_pokedex_fixture(project_root: Path) -> None:
+    pokedex_path = project_root / "vendor" / "pokemon-showdown" / "dist" / "data" / "pokedex.js"
+    pokedex_path.parent.mkdir(parents=True)
+    pokedex_path.write_text(
+        """
+exports.Pokedex = {
+  dugtrio: {
+    num: 51,
+    name: "Dugtrio",
+    types: ["Ground"],
+    baseStats: { hp: 35, atk: 100, def: 50, spa: 50, spd: 70, spe: 120 },
+    abilities: { 0: "Sand Veil" },
+  },
+  starmie: {
+    num: 121,
+    name: "Starmie",
+    types: ["Water", "Psychic"],
+    baseStats: { hp: 60, atk: 75, def: 85, spa: 100, spd: 85, spe: 115 },
+    abilities: { 0: "Illuminate" },
+  },
+};
+""".lstrip(),
+        encoding="utf-8",
+    )
 
 
 def _metadata(
