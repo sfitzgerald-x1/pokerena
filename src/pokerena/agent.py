@@ -478,6 +478,7 @@ class ShowdownClientAdapter:
         self.current_battle_id: Optional[str] = None
         self.pending_challenger: Optional[str] = None
         self.pending_format: Optional[str] = None
+        self._finished_battle_ids: set[str] = set()
         self._warned_malformed_frames: set[str] = set()
 
     def connect(self) -> None:
@@ -727,6 +728,8 @@ class ShowdownClientAdapter:
         )
 
     def _consume_battle_room(self, room_id: str, lines: List[str]) -> List[SessionEvent]:
+        if room_id in self._finished_battle_ids and room_id != self.current_battle_id:
+            return []
         if self.current_battle_id and room_id != self.current_battle_id:
             self._send(room_id, "/forfeit")
             return [
@@ -743,6 +746,7 @@ class ShowdownClientAdapter:
 
         events: List[SessionEvent] = []
         if self.current_battle_id != room_id:
+            self._finished_battle_ids.discard(room_id)
             self.current_battle_id = room_id
             events.append(
                 SessionEvent(
@@ -812,6 +816,7 @@ class ShowdownClientAdapter:
             self.current_battle_id = None
             self.pending_challenger = None
             self.pending_format = None
+            self._finished_battle_ids.add(room_id)
         return events
 
 
@@ -2026,4 +2031,3 @@ def _split_protocol_message(payload: str) -> List[tuple[Optional[str], List[str]
 def _user_id(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).lower()
     return "".join(character for character in normalized if character.isalnum())
-

@@ -782,6 +782,31 @@ class BattleAgentRuntimeTest(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(fake_connection.sent, ["|/utm null", "|/accept human123"])
 
+    def test_showdown_client_adapter_ignores_cleanup_for_finished_battle(self) -> None:
+        adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
+        fake_connection = _FakeConnection()
+        adapter.connection = fake_connection
+        adapter.authenticated = True
+        adapter.current_battle_id = "battle-gen3randombattle-99"
+        adapter.pending_challenger = "human"
+        adapter.pending_format = "gen3randombattle"
+
+        finish_events = adapter._consume_message(
+            ">battle-gen3randombattle-99\n|win|human"
+        )
+        cleanup_events = adapter._consume_message(
+            ">battle-gen3randombattle-99\n|deinit"
+        )
+        challenge_events = adapter._consume_message(
+            '|updatechallenges|{"challengesFrom":{"next-human":"gen3randombattle"}}'
+        )
+
+        self.assertEqual(finish_events[-1].event_type, "battle_finished")
+        self.assertEqual(cleanup_events, [])
+        self.assertEqual(challenge_events, [])
+        self.assertEqual(adapter.current_battle_id, None)
+        self.assertEqual(fake_connection.sent, ["|/utm null", "|/accept next-human"])
+
     def test_showdown_client_adapter_parses_battle_room_and_submits_choice(self) -> None:
         adapter = ShowdownClientAdapter(server_config=_server_config(), agent=_load_showdown_agent())
         fake_connection = _FakeConnection()
