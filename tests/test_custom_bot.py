@@ -1294,6 +1294,60 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual(decision.decision, "move 1")
         self.assertIn("ignored illegal decision", decision.notes)
 
+    def test_claude_override_ignores_redundant_sleep_into_statused_opponent(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Sleep Powder", "id": "sleeppowder", "disabled": False},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100 par",
+                "|turn|3",
+            ],
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Sleep Powder": _metadata(
+                "Sleep Powder",
+                category="Status",
+                base_power=0,
+                accuracy=75,
+                status="slp",
+            ),
+        }
+        ranges = {"Tackle": (20, 25)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "turn-context.json"
+            context_path.write_text(json.dumps(context), encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["claude"],
+                0,
+                stdout=(
+                    '{"schema_version":"pokerena.decision.v1",'
+                    '"decision":"move 2","notes":"Sleep would be strong."}'
+                ),
+                stderr="",
+            )
+            with _patched_calc(metadata, ranges), mock.patch(
+                "pokerena.custom_bot_claude.subprocess.run",
+                return_value=completed,
+            ) as run:
+                decision = decide_custom_bot_claude_from_files(
+                    context_path=str(context_path),
+                    capture_path=None,
+                    seed="1",
+                    project_root=Path.cwd(),
+                )
+
+        self.assertEqual(decision.decision, "move 1")
+        self.assertIn("opponent already has major status par", decision.notes)
+        prompt = run.call_args.kwargs["input"]
+        self.assertIn('"opponent_major_status": "par"', prompt)
+        self.assertIn("do not override to sleep/paralysis/poison status moves", prompt)
+
     def test_claude_override_falls_back_to_custom_bot_when_claude_fails(self) -> None:
         context = _context(
             [{"move": "Tackle", "id": "tackle", "disabled": False}],
