@@ -33,6 +33,7 @@ CUSTOM_BOT_SUPPORTED_FORMAT = "gen1randombattle"
 MAJOR_STATUSES = {"slp", "par", "psn", "tox", "brn", "frz"}
 SLEEP_MOVES = {"hypnosis", "lovelykiss", "sing", "sleeppowder", "spore"}
 CHARGE_MOVE_IDS = {"solarbeam", "skyattack", "skullbash"}
+SELF_KO_MOVE_IDS = {"explosion", "selfdestruct"}
 BOOST_CAP = 6
 GEN1_TYPE_IMMUNITIES = {
     "Electric": {"Ground"},
@@ -193,12 +194,19 @@ def build_custom_bot_plan(
     sleep_clause_active = _sleep_clause_active(context, public_lines)
     own_boosts = _boosts_for_active(context, public_lines, own_active.ident)
     has_ko_line = _has_ko_line(damage_results.results.values(), opponent)
+    mon_count_advantage = _remaining_pokemon_advantage(context, public_lines)
     action_scores: List[ScoredAction] = []
     best_damage_score = 0.0
     for candidate in move_candidates:
         damage_result = damage_results.results.get(candidate.choice)
         if damage_result is not None:
-            score, reason = _score_damaging_move(candidate, damage_result, opponent)
+            score, reason = _score_damaging_move(
+                candidate,
+                damage_result,
+                own_active=own_active,
+                opponent=opponent,
+                mon_count_advantage=mon_count_advantage,
+            )
             score = _add_secondary_status_value(score, candidate, opponent)
             best_damage_score = max(best_damage_score, score)
         elif _is_damaging_metadata(candidate.metadata):
@@ -438,7 +446,10 @@ def _damage_results_by_choice(
 def _score_damaging_move(
     candidate: MoveCandidate,
     damage_result: Dict[str, Any],
+    *,
+    own_active: PokemonState,
     opponent: PokemonState,
+    mon_count_advantage: int,
 ) -> tuple[float, str]:
     range_percent = damage_result.get("range_percent") if isinstance(damage_result, dict) else None
     if not isinstance(range_percent, dict):
@@ -467,7 +478,36 @@ def _score_damaging_move(
     if bool(candidate.metadata.get("charge")) or move_id in CHARGE_MOVE_IDS:
         score *= 0.45
     reason = f"damage {min_pct:.1f}-{max_pct:.1f}%"
+    if move_id in SELF_KO_MOVE_IDS:
+        multiplier, self_ko_reason = _self_ko_move_multiplier(
+            own_active=own_active,
+            min_pct=min_pct,
+            max_pct=max_pct,
+            target_hp_pct=target_hp_pct,
+            mon_count_advantage=mon_count_advantage,
+        )
+        score *= multiplier
+        reason = f"{reason}; {self_ko_reason}"
     return max(0.0, score), reason
+
+
+def _self_ko_move_multiplier(
+    *,
+    own_active: PokemonState,
+    min_pct: float,
+    max_pct: float,
+    target_hp_pct: float,
+    mon_count_advantage: int,
+) -> tuple[float, str]:
+    own_hp_fraction = own_active.hp_fraction if own_active.hp_fraction is not None else 1.0
+    if own_hp_fraction <= 0.30:
+        return 1.0, "self-KO allowed: user low HP"
+    sees_ko = max_pct >= target_hp_pct
+    if sees_ko and mon_count_advantage > 0:
+        return 1.0, "self-KO allowed: KO while ahead in mons"
+    if sees_ko:
+        return 0.15, "self-KO deprioritized: KO trade not ahead in mons"
+    return 0.12, "self-KO deprioritized: no KO from healthy user"
 
 
 def _score_uncalculated_damaging_move(
@@ -486,7 +526,15 @@ def _score_uncalculated_damaging_move(
     move_type = _move_type(candidate.metadata)
     if move_type and move_type in _pokemon_types(own_active, project_root):
         score *= 1.5
-    return max(1.0, min(score, 35.0)), "estimated damage: calc unavailable"
+    reason = "estimated damage: calc unavailable"
+    if _metadata_id(candidate.metadata) in SELF_KO_MOVE_IDS:
+        own_hp_fraction = own_active.hp_fraction if own_active.hp_fraction is not None else 1.0
+        if own_hp_fraction > 0.30:
+            score *= 0.12
+            reason = "estimated damage: self-KO deprioritized while calc unavailable"
+        else:
+            reason = "estimated damage: self-KO allowed at low HP"
+    return max(1.0, min(score, 35.0)), reason
 
 
 def _has_ko_line(
@@ -934,6 +982,55 @@ def _available_switches(request: Dict[str, Any]) -> List[tuple[str, str, Dict[st
             )
         )
     return switches
+
+
+def _remaining_pokemon_advantage(context: Dict[str, Any], public_lines: Sequence[str]) -> int:
+    own_remaining = _remaining_own_pokemon(context)
+    opponent_remaining = _remaining_opponent_pokemon(context, public_lines)
+    if own_remaining is None or opponent_remaining is None:
+        return 0
+    return own_remaining - opponent_remaining
+
+
+def _remaining_own_pokemon(context: Dict[str, Any]) -> Optional[int]:
+    pokemon = _side_pokemon(context)
+    if not pokemon:
+        return None
+    remaining = 0
+    for candidate in pokemon:
+        if not isinstance(candidate, dict):
+            continue
+        if "fnt" not in str(candidate.get("condition") or ""):
+            remaining += 1
+    return remaining
+
+
+def _remaining_opponent_pokemon(context: Dict[str, Any], public_lines: Sequence[str]) -> Optional[int]:
+    team_size = _side_team_size(context)
+    if team_size is None:
+        return None
+    opponent_slot = _opponent_slot(_effective_player_slot(context))
+    fainted = {
+        _identity_key(parts[2])
+        for line in public_lines
+        if isinstance(line, str)
+        for parts in [line.split("|")]
+        if len(parts) >= 3 and parts[1] == "faint" and _ident_matches_slot(parts[2], opponent_slot)
+    }
+    return max(0, team_size - len(fainted))
+
+
+def _side_team_size(context: Dict[str, Any]) -> Optional[int]:
+    pokemon = _side_pokemon(context)
+    return len(pokemon) if pokemon else None
+
+
+def _side_pokemon(context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    side = _context_side(context)
+    pokemon = side.get("pokemon") if isinstance(side, dict) else None
+    if not isinstance(pokemon, list):
+        return []
+    return [candidate for candidate in pokemon if isinstance(candidate, dict)]
 
 
 def _choose_weighted(actions: Sequence[ScoredAction], rng: random.Random) -> str:

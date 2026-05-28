@@ -478,6 +478,123 @@ class CustomBotTest(unittest.TestCase):
         by_choice = {action.choice: action for action in plan.actions}
         self.assertLess(by_choice["move 1"].score, by_choice["move 2"].score)
 
+    def test_explosion_is_penalized_from_high_hp_without_ko(self) -> None:
+        context = _context(
+            [
+                {"move": "Explosion", "id": "explosion", "disabled": False},
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+            ],
+            own_species="Gengar",
+            opponent_species="Starmie",
+        )
+        metadata = {
+            "Explosion": _metadata("Explosion", base_power=170),
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+        }
+        ranges = {"Explosion": (65, 75), "Thunderbolt": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
+
+    def test_explosion_is_penalized_from_high_hp_when_ko_trade_is_not_ahead(self) -> None:
+        context = _context(
+            [
+                {"move": "Explosion", "id": "explosion", "disabled": False},
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+            ],
+            own_species="Gengar",
+            opponent_species="Starmie",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Gengar|Gengar, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|60/100",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Explosion": _metadata("Explosion", base_power=170),
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+        }
+        ranges = {"Explosion": (70, 80), "Thunderbolt": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
+
+    def test_explosion_is_allowed_for_ko_when_ahead_in_mon_count(self) -> None:
+        context = _context(
+            [
+                {"move": "Explosion", "id": "explosion", "disabled": False},
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+            ],
+            own_species="Gengar",
+            opponent_species="Starmie",
+            bench=[
+                {"ident": "p1: Tauros", "details": "Tauros, L80", "condition": "100/100"},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Gengar|Gengar, L80|100/100",
+                "|switch|p2a: Alakazam|Alakazam, L80|0 fnt",
+                "|faint|p2a: Alakazam",
+                "|switch|p2a: Starmie|Starmie, L80|60/100",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Explosion": _metadata("Explosion", base_power=170),
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+        }
+        ranges = {"Explosion": (70, 80), "Thunderbolt": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+
+    def test_explosion_is_allowed_from_low_hp(self) -> None:
+        context = _context(
+            [
+                {"move": "Explosion", "id": "explosion", "disabled": False},
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+            ],
+            own_species="Gengar",
+            opponent_species="Starmie",
+            active_condition="20/100",
+        )
+        metadata = {
+            "Explosion": _metadata("Explosion", base_power=170),
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+        }
+        ranges = {"Explosion": (65, 75), "Thunderbolt": (20, 25)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+
+    def test_explosion_is_penalized_when_calc_batch_fails(self) -> None:
+        context = _context(
+            [
+                {"move": "Explosion", "id": "explosion", "disabled": False},
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+            ],
+            own_species="Gengar",
+            opponent_species="Starmie",
+        )
+        metadata = {
+            "Explosion": _metadata("Explosion", base_power=170),
+            "Body Slam": _metadata("Body Slam", base_power=85),
+        }
+
+        with _patched_calc(metadata, {}, damage_error=ConfigError("worker down")):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
+
     def test_high_crit_moves_receive_reliability_bonus(self) -> None:
         context = _context(
             [
