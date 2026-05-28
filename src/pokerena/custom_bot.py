@@ -35,6 +35,7 @@ SLEEP_MOVES = {"hypnosis", "lovelykiss", "sing", "sleeppowder", "spore"}
 CHARGE_MOVE_IDS = {"solarbeam", "skyattack", "skullbash"}
 BOOST_CAP = 6
 _POKEDEX_BASE_SPEED_CACHE: Dict[Path, Dict[str, int]] = {}
+_POKEDEX_TYPES_CACHE: Dict[Path, Dict[str, List[str]]] = {}
 
 
 @dataclass(frozen=True)
@@ -501,6 +502,8 @@ def _score_status_or_utility_move(
             return 0.0, f"target already statused with {opponent.status}"
         if status == "slp" and sleep_clause_active:
             return 0.0, "sleep clause active"
+        if _status_move_is_ineffective(candidate, opponent, project_root):
+            return 0.0, "status move is ineffective into target type"
         return _status_base_value(status, sleep_clause_active) * _accuracy_factor(metadata), f"inflict {status}"
 
     move_id = _metadata_id(metadata)
@@ -540,6 +543,17 @@ def _status_base_value(status: str, sleep_clause_active: bool) -> float:
     if status in {"psn", "tox", "brn"}:
         return 45.0
     return 20.0
+
+
+def _status_move_is_ineffective(
+    candidate: MoveCandidate,
+    opponent: PokemonState,
+    project_root: Path,
+) -> bool:
+    move_id = _metadata_id(candidate.metadata)
+    if move_id != "thunderwave":
+        return False
+    return "Ground" in _pokemon_types(opponent, project_root)
 
 
 def _boost_score(
@@ -1170,7 +1184,27 @@ def _base_speed_for_species(species: str, project_root: Path) -> Optional[int]:
     return _POKEDEX_BASE_SPEED_CACHE[root].get(_normalize_move_id(species))
 
 
+def _pokemon_types(pokemon: PokemonState, project_root: Path) -> List[str]:
+    try:
+        root = project_root.resolve()
+    except OSError:
+        root = project_root
+    if root not in _POKEDEX_TYPES_CACHE:
+        _POKEDEX_TYPES_CACHE[root] = _load_pokedex_types(root)
+    return list(_POKEDEX_TYPES_CACHE[root].get(_normalize_move_id(pokemon.species), []))
+
+
 def _load_pokedex_base_spe(project_root: Path) -> Dict[str, int]:
+    parsed = _load_pokedex_entries(project_root)
+    return {species_id: item["spe"] for species_id, item in parsed.items() if "spe" in item}
+
+
+def _load_pokedex_types(project_root: Path) -> Dict[str, List[str]]:
+    parsed = _load_pokedex_entries(project_root)
+    return {species_id: list(item["types"]) for species_id, item in parsed.items() if "types" in item}
+
+
+def _load_pokedex_entries(project_root: Path) -> Dict[str, Dict[str, Any]]:
     for relative_path in (
         Path("vendor/pokemon-showdown/dist/data/pokedex.js"),
         Path("vendor/pokemon-showdown/data/pokedex.ts"),
@@ -1182,15 +1216,18 @@ def _load_pokedex_base_spe(project_root: Path) -> Dict[str, int]:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        speeds: Dict[str, int] = {}
+        entries: Dict[str, Dict[str, Any]] = {}
         pattern = re.compile(
-            r"^\s*([a-z0-9]+):\s*\{.*?baseStats:\s*\{[^}]*\bspe:\s*(\d+)",
+            r"^\s*([a-z0-9]+):\s*\{.*?types:\s*\[([^\]]+)\].*?baseStats:\s*\{[^}]*\bspe:\s*(\d+)",
             re.MULTILINE | re.DOTALL,
         )
         for match in pattern.finditer(text):
-            speeds[match.group(1)] = int(match.group(2))
-        if speeds:
-            return speeds
+            entries[match.group(1)] = {
+                "types": re.findall(r'"([^"]+)"', match.group(2)),
+                "spe": int(match.group(3)),
+            }
+        if entries:
+            return entries
     return {}
 
 

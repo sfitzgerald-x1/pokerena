@@ -188,6 +188,35 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual(plan.actions, [])
         self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
 
+    def test_thunder_wave_scores_zero_against_ground_type(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Thunder Wave", "id": "thunderwave", "disabled": False},
+            ],
+            opponent_species="Dugtrio",
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Thunder Wave": _metadata(
+                "Thunder Wave",
+                category="Status",
+                base_power=0,
+                accuracy=100,
+                status="par",
+            ),
+        }
+        ranges = {"Tackle": (12, 15)}
+
+        with _patched_calc(metadata, ranges), mock.patch(
+            "pokerena.custom_bot._pokemon_types",
+            return_value=["Ground"],
+        ):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(4))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+        self.assertNotEqual(plan.decision, "move 2")
+
     def test_status_scoring_uses_request_side_when_context_slot_is_stale(self) -> None:
         context = _context(
             [
