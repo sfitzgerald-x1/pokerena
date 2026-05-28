@@ -434,6 +434,37 @@ class CustomBotTest(unittest.TestCase):
         self.assertGreater(high_plan.actions[0].score, 70)
         self.assertLess(low_plan.actions[0].score, 5)
 
+    def test_repeat_setup_boost_is_deprioritized_when_ko_is_available(self) -> None:
+        context = _context(
+            [
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+                {"move": "Swords Dance", "id": "swordsdance", "disabled": False},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|-boost|p1a: Venusaur|atk|2",
+                "|switch|p2a: Starmie|Starmie, L80|30/100",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Body Slam": _metadata("Body Slam", base_power=85),
+            "Swords Dance": _metadata(
+                "Swords Dance",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"atk": 2},
+            ),
+        }
+        ranges = {"Body Slam": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+
     def test_agility_scores_zero_when_already_faster(self) -> None:
         context = _context(
             [{"move": "Agility", "id": "agility", "disabled": False}],

@@ -15,7 +15,7 @@ from pathlib import Path
 import random
 import re
 import sys
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .agent import AgentDecision, choose_first_legal, choose_random_legal
 from .calc import (
@@ -185,6 +185,7 @@ def build_custom_bot_plan(
     ] if damage_results.warning else []
     sleep_clause_active = _sleep_clause_active(context, public_lines)
     own_boosts = _boosts_for_active(context, public_lines, own_active.ident)
+    has_ko_line = _has_ko_line(damage_results.results.values(), opponent)
     action_scores: List[ScoredAction] = []
     best_damage_score = 0.0
     for candidate in move_candidates:
@@ -200,6 +201,7 @@ def build_custom_bot_plan(
                 opponent=opponent,
                 own_boosts=own_boosts,
                 sleep_clause_active=sleep_clause_active,
+                has_ko_line=has_ko_line,
                 project_root=root,
             )
         if score > 0:
@@ -453,6 +455,21 @@ def _score_damaging_move(
     return max(0.0, score), reason
 
 
+def _has_ko_line(
+    damage_results: Iterable[Dict[str, Any]],
+    opponent: PokemonState,
+) -> bool:
+    target_hp_pct = 100.0 * (opponent.hp_fraction if opponent.hp_fraction is not None else 1.0)
+    for damage_result in damage_results:
+        range_percent = damage_result.get("range_percent") if isinstance(damage_result, dict) else None
+        if not isinstance(range_percent, dict):
+            continue
+        max_pct = _float_value(range_percent.get("max")) or 0.0
+        if max_pct >= target_hp_pct:
+            return True
+    return False
+
+
 def _hyper_beam_recharge_risk_multiplier(
     *,
     min_pct: float,
@@ -496,6 +513,7 @@ def _score_status_or_utility_move(
     opponent: PokemonState,
     own_boosts: Dict[str, int],
     sleep_clause_active: bool,
+    has_ko_line: bool,
     project_root: Path,
 ) -> tuple[float, str]:
     metadata = candidate.metadata
@@ -514,14 +532,19 @@ def _score_status_or_utility_move(
     boosts = metadata.get("boosts")
     if isinstance(boosts, dict) and boosts:
         if move_id == "agility" and "spe" in boosts:
-            return _agility_score(
+            score, reason = _agility_score(
                 own_active=own_active,
                 opponent=opponent,
                 own_boosts=own_boosts,
                 hp_fraction=hp_fraction,
                 project_root=project_root,
             )
+            if score > 0 and has_ko_line and _has_positive_boost(own_boosts):
+                return score * 0.15, f"{reason}; setup boost deprioritized: KO available"
+            return score, reason
         score = _boost_score(move_id, boosts, hp_fraction, own_boosts)
+        if score > 0 and has_ko_line and _has_positive_boost(own_boosts):
+            return score * 0.15, "setup boost deprioritized: KO available"
         return score, "setup boost"
 
     volatile_status = str(metadata.get("volatile_status") or "")
