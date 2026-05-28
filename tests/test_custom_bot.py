@@ -106,6 +106,36 @@ class CustomBotTest(unittest.TestCase):
         self.assertIn("move 2", by_choice)
         self.assertNotIn("move 1", by_choice)
 
+    def test_status_move_is_deprioritized_when_ko_is_available(self) -> None:
+        context = _context(
+            [
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+                {"move": "Sleep Powder", "id": "sleeppowder", "disabled": False},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|30/100",
+                "|turn|3",
+            ],
+        )
+        metadata = {
+            "Body Slam": _metadata("Body Slam", base_power=85),
+            "Sleep Powder": _metadata(
+                "Sleep Powder",
+                category="Status",
+                base_power=0,
+                accuracy=75,
+                status="slp",
+            ),
+        }
+        ranges = {"Body Slam": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(2))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+
     def test_sleep_moves_score_zero_when_sleep_clause_is_active(self) -> None:
         context = _context(
             [{"move": "Sleep Powder", "id": "sleeppowder", "disabled": False}],
@@ -263,6 +293,37 @@ class CustomBotTest(unittest.TestCase):
 
         self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
         self.assertNotEqual(plan.decision, "move 2")
+
+    def test_confuse_ray_is_deprioritized_when_ko_is_available(self) -> None:
+        context = _context(
+            [
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+                {"move": "Confuse Ray", "id": "confuseray", "disabled": False},
+            ],
+            opponent_species="Hypno",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Golbat|Golbat, L80|100/100",
+                "|switch|p2a: Hypno|Hypno, L80|30/100",
+                "|turn|2",
+            ],
+        )
+        metadata = {
+            "Body Slam": _metadata("Body Slam", base_power=85),
+            "Confuse Ray": _metadata(
+                "Confuse Ray",
+                category="Status",
+                base_power=0,
+                accuracy=100,
+                volatile_status="confusion",
+            ),
+        }
+        ranges = {"Body Slam": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(4))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
 
     def test_confuse_ray_scores_after_confusion_ends(self) -> None:
         context = _context(

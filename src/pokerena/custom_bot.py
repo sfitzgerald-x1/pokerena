@@ -525,7 +525,10 @@ def _score_status_or_utility_move(
             return 0.0, "sleep clause active"
         if _status_move_is_ineffective(candidate, opponent, project_root):
             return 0.0, "status move is ineffective into target type"
-        return _status_base_value(status, sleep_clause_active) * _accuracy_factor(metadata), f"inflict {status}"
+        score = _status_base_value(status, sleep_clause_active) * _accuracy_factor(metadata)
+        if has_ko_line:
+            return score * 0.15, f"inflict {status} deprioritized: KO available"
+        return score, f"inflict {status}"
 
     move_id = _metadata_id(metadata)
     hp_fraction = own_active.hp_fraction if own_active.hp_fraction is not None else 1.0
@@ -549,11 +552,17 @@ def _score_status_or_utility_move(
 
     volatile_status = str(metadata.get("volatile_status") or "")
     if volatile_status == "leechseed" and opponent.status not in MAJOR_STATUSES:
-        return 40.0 * _accuracy_factor(metadata), "Leech Seed pressure"
+        score = 40.0 * _accuracy_factor(metadata)
+        if has_ko_line:
+            return score * 0.15, "Leech Seed pressure deprioritized: KO available"
+        return score, "Leech Seed pressure"
     if volatile_status == "confusion":
         if _has_volatile_status(opponent, "confusion"):
             return 0.0, "target already confused"
-        return 35.0 * _accuracy_factor(metadata), "confusion pressure"
+        score = 35.0 * _accuracy_factor(metadata)
+        if has_ko_line:
+            return score * 0.15, "confusion pressure deprioritized: KO available"
+        return score, "confusion pressure"
     if volatile_status in {"reflect", "lightscreen"}:
         return (35.0 * hp_fraction) if hp_fraction >= 0.35 else 5.0, volatile_status
     if move_id == "rest":
