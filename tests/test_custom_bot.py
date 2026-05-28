@@ -251,14 +251,62 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
         self.assertNotEqual(plan.decision, "move 2")
 
+    def test_zero_effective_damage_move_is_not_selected_when_calc_skips(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+            ],
+            opponent_species="Marowak",
+        )
+        metadata = {
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+            "Body Slam": _metadata("Body Slam", base_power=85),
+        }
+        ranges = {"Body Slam": (20, 25)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            _write_pokedex_fixture(project_root)
+            with _patched_calc(metadata, ranges):
+                plan = build_custom_bot_plan(context, project_root=project_root, rng=random.Random(4))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
+        self.assertNotEqual(plan.decision, "move 1")
+
+    def test_zero_effective_damage_move_is_not_selected_when_calc_batch_fails(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+            ],
+            opponent_species="Marowak",
+        )
+        metadata = {
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+            "Body Slam": _metadata("Body Slam", base_power=85),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            _write_pokedex_fixture(project_root)
+            with _patched_calc(metadata, {}, damage_error=ConfigError("worker down")):
+                plan = build_custom_bot_plan(context, project_root=project_root, rng=random.Random(4))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
+        self.assertIn("damage calc batch failed", plan.warnings[0])
+        self.assertNotEqual(plan.decision, "move 1")
+
     def test_pokedex_type_lookup_parses_showdown_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
             _write_pokedex_fixture(project_root)
 
             dugtrio = PokemonState("Dugtrio", None, {"species": "Dugtrio"}, 1.0, None)
+            marowak = PokemonState("Marowak", None, {"species": "Marowak"}, 1.0, None)
 
             self.assertEqual(_pokemon_types(dugtrio, project_root), ["Ground"])
+            self.assertEqual(_pokemon_types(marowak, project_root), ["Ground"])
             self.assertEqual(_base_speed_for_species("Dugtrio", project_root), 120)
 
     def test_confuse_ray_scores_zero_when_target_already_confused(self) -> None:
@@ -999,6 +1047,13 @@ exports.Pokedex = {
     baseStats: { hp: 60, atk: 75, def: 85, spa: 100, spd: 85, spe: 115 },
     abilities: { 0: "Illuminate" },
   },
+  marowak: {
+    num: 105,
+    name: "Marowak",
+    types: ["Ground"],
+    baseStats: { hp: 60, atk: 80, def: 110, spa: 50, spd: 80, spe: 45 },
+    abilities: { 0: "Rock Head" },
+  },
 };
 """.lstrip(),
         encoding="utf-8",
@@ -1018,11 +1073,13 @@ def _metadata(
     recharge: bool = False,
     charge: bool = False,
     high_crit: bool = False,
+    move_type: str = "Normal",
 ) -> dict:
     return {
         "requested_name": name,
         "id": name.lower().replace(" ", ""),
         "name": name,
+        "type": move_type,
         "category": category,
         "base_power": base_power,
         "accuracy": accuracy,

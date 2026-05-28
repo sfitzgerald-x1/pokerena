@@ -34,6 +34,13 @@ MAJOR_STATUSES = {"slp", "par", "psn", "tox", "brn", "frz"}
 SLEEP_MOVES = {"hypnosis", "lovelykiss", "sing", "sleeppowder", "spore"}
 CHARGE_MOVE_IDS = {"solarbeam", "skyattack", "skullbash"}
 BOOST_CAP = 6
+GEN1_TYPE_IMMUNITIES = {
+    "Electric": {"Ground"},
+    "Fighting": {"Ghost"},
+    "Ghost": {"Normal", "Psychic"},
+    "Ground": {"Flying"},
+    "Normal": {"Ghost"},
+}
 _POKEDEX_BASE_SPEED_CACHE: Dict[Path, Dict[str, int]] = {}
 _POKEDEX_TYPES_CACHE: Dict[Path, Dict[str, List[str]]] = {}
 
@@ -193,6 +200,14 @@ def build_custom_bot_plan(
         if damage_result is not None:
             score, reason = _score_damaging_move(candidate, damage_result, opponent)
             score = _add_secondary_status_value(score, candidate, opponent)
+            best_damage_score = max(best_damage_score, score)
+        elif _is_damaging_metadata(candidate.metadata):
+            score, reason = _score_uncalculated_damaging_move(
+                candidate,
+                own_active=own_active,
+                opponent=opponent,
+                project_root=root,
+            )
             best_damage_score = max(best_damage_score, score)
         else:
             score, reason = _score_status_or_utility_move(
@@ -455,6 +470,25 @@ def _score_damaging_move(
     return max(0.0, score), reason
 
 
+def _score_uncalculated_damaging_move(
+    candidate: MoveCandidate,
+    *,
+    own_active: PokemonState,
+    opponent: PokemonState,
+    project_root: Path,
+) -> tuple[float, str]:
+    if _move_has_no_effect(candidate, opponent, project_root):
+        return 0.0, "damage move has no effect into target type"
+    base_power = _int_value(candidate.metadata.get("base_power"), 0)
+    if base_power <= 0:
+        return 0.0, "damage calc skipped"
+    score = base_power * 0.25 * _accuracy_factor(candidate.metadata)
+    move_type = _move_type(candidate.metadata)
+    if move_type and move_type in _pokemon_types(own_active, project_root):
+        score *= 1.5
+    return max(1.0, min(score, 35.0)), "estimated damage: calc unavailable"
+
+
 def _has_ko_line(
     damage_results: Iterable[Dict[str, Any]],
     opponent: PokemonState,
@@ -591,6 +625,27 @@ def _status_move_is_ineffective(
     if move_id != "thunderwave":
         return False
     return "Ground" in _pokemon_types(opponent, project_root)
+
+
+def _move_has_no_effect(
+    candidate: MoveCandidate,
+    opponent: PokemonState,
+    project_root: Path,
+) -> bool:
+    move_type = _move_type(candidate.metadata)
+    if not move_type:
+        return False
+    immune_types = GEN1_TYPE_IMMUNITIES.get(move_type)
+    if not immune_types:
+        return False
+    return any(pokemon_type in immune_types for pokemon_type in _pokemon_types(opponent, project_root))
+
+
+def _move_type(metadata: Dict[str, Any]) -> Optional[str]:
+    move_type = metadata.get("type")
+    if not isinstance(move_type, str) or not move_type.strip():
+        return None
+    return move_type.strip().title()
 
 
 def _boost_score(
@@ -1254,6 +1309,7 @@ def _heuristic_move_metadata(move_name: str, request_move: Dict[str, Any]) -> Di
         "name": move_name,
         "category": category if category in {"Physical", "Special", "Status"} else "Physical",
         "base_power": base_power if isinstance(base_power, int) else 1,
+        "type": request_move.get("type") if isinstance(request_move.get("type"), str) else None,
         "accuracy": 100,
         "flags": {},
         "boosts": {},
