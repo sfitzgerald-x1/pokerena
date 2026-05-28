@@ -223,9 +223,10 @@ def build_custom_bot_plan(
             warnings=damage_warnings,
         )
 
-    decision = _choose_weighted(action_scores, chooser)
-    notes = _notes(decision, action_scores, fallback_reason=None, warnings=damage_warnings)
-    return CustomBotPlan(decision=decision, notes=notes, actions=action_scores, warnings=damage_warnings)
+    selection_pool = _selection_pool(action_scores)
+    decision = _choose_weighted(selection_pool, chooser)
+    notes = _notes(decision, selection_pool, fallback_reason=None, warnings=damage_warnings)
+    return CustomBotPlan(decision=decision, notes=notes, actions=selection_pool, warnings=damage_warnings)
 
 
 def _forced_switch_plan(
@@ -827,6 +828,17 @@ def _choose_weighted(actions: Sequence[ScoredAction], rng: random.Random) -> str
         if roll <= cumulative:
             return action.choice
     return actions[-1].choice
+
+
+def _selection_pool(actions: Sequence[ScoredAction]) -> List[ScoredAction]:
+    if len(actions) <= 1:
+        return list(actions)
+    best_score = max(action.score for action in actions)
+    if best_score < 10.0:
+        return list(actions)
+    minimum_competitive_score = max(10.0, best_score * 0.55)
+    pool = [action for action in actions if action.score >= minimum_competitive_score]
+    return pool or list(actions)
 
 
 def _scored_action(choice: str, label: str, score: float, reason: str) -> ScoredAction:

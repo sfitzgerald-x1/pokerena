@@ -11,6 +11,7 @@ from pokerena.custom_bot import (
     _effective_player_slot,
     _revealed_opponent_moves,
     _scored_action,
+    _selection_pool,
     _sleep_clause_active,
     _status_base_value,
     build_custom_bot_plan,
@@ -39,6 +40,42 @@ class CustomBotTest(unittest.TestCase):
         self.assertAlmostEqual(by_choice["move 2"].weight, by_choice["move 2"].score ** 2)
         self.assertIn("custom-bot gen1randombattle weighted scores", plan.notes)
 
+    def test_selection_pool_prunes_dominated_low_score_moves(self) -> None:
+        actions = [
+            _scored_action("move 1", "Earthquake", 28.8, "damage"),
+            _scored_action("move 2", "Slash", 26.9, "damage"),
+            _scored_action("move 4", "Rock Slide", 12.9, "damage"),
+        ]
+
+        pool = _selection_pool(actions)
+
+        self.assertEqual([action.choice for action in pool], ["move 1", "move 2"])
+
+    def test_dominated_damage_move_is_not_sampled(self) -> None:
+        context = _context(
+            [
+                {"move": "Earthquake", "id": "earthquake", "disabled": False},
+                {"move": "Slash", "id": "slash", "disabled": False},
+                {"move": "Substitute", "id": "substitute", "disabled": False},
+                {"move": "Rock Slide", "id": "rockslide", "disabled": False},
+            ],
+            own_species="Dugtrio",
+            opponent_species="Dugtrio",
+        )
+        metadata = {
+            "Earthquake": _metadata("Earthquake", base_power=100),
+            "Slash": _metadata("Slash", base_power=70, high_crit=True),
+            "Substitute": _metadata("Substitute", category="Status", base_power=0),
+            "Rock Slide": _metadata("Rock Slide", base_power=75, accuracy=90),
+        }
+        ranges = {"Earthquake": (26.4, 31.1), "Slash": (23.4, 27.8), "Rock Slide": (13.0, 15.7)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(2))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1", "move 2"})
+        self.assertNotEqual(plan.decision, "move 4")
+
     def test_status_move_scores_high_against_non_statused_target(self) -> None:
         context = _context(
             [
@@ -62,7 +99,8 @@ class CustomBotTest(unittest.TestCase):
             plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(2))
 
         by_choice = {action.choice: action for action in plan.actions}
-        self.assertGreater(by_choice["move 2"].score, by_choice["move 1"].score)
+        self.assertIn("move 2", by_choice)
+        self.assertNotIn("move 1", by_choice)
 
     def test_sleep_moves_score_zero_when_sleep_clause_is_active(self) -> None:
         context = _context(
@@ -204,7 +242,8 @@ class CustomBotTest(unittest.TestCase):
             plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(4))
 
         by_choice = {action.choice: action for action in plan.actions}
-        self.assertLess(by_choice["move 1"].score, by_choice["move 2"].score)
+        self.assertIn("move 2", by_choice)
+        self.assertNotIn("move 1", by_choice)
 
     def test_hyper_beam_is_partially_penalized_when_ko_is_uncertain(self) -> None:
         context = _context(
