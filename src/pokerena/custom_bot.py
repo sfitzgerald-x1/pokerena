@@ -139,7 +139,18 @@ def build_custom_bot_plan(
 
     request_kind = str(context.get("request_kind") or "")
     if request_kind == "switch":
-        return _forced_switch_plan(request, chooser)
+        root = project_root or detect_project_root()
+        public_lines = _public_lines(context, capture_payload)
+        opponent = _active_opponent_from_public_history(context, public_lines)
+        return _forced_switch_plan(
+            request,
+            chooser,
+            context=context,
+            opponent=opponent,
+            public_lines=public_lines,
+            project_root=root,
+            calc_timeout_seconds=calc_timeout_seconds,
+        )
 
     if request_kind != "move" or not _is_supported_gen1_randbat(context):
         return _fallback_plan(request, "unsupported format or request kind", chooser)
@@ -217,19 +228,35 @@ def build_custom_bot_plan(
     return CustomBotPlan(decision=decision, notes=notes, actions=action_scores, warnings=damage_warnings)
 
 
-def _forced_switch_plan(request: Dict[str, Any], rng: random.Random) -> CustomBotPlan:
+def _forced_switch_plan(
+    request: Dict[str, Any],
+    rng: random.Random,
+    *,
+    context: Optional[Dict[str, Any]] = None,
+    opponent: Optional[PokemonState] = None,
+    public_lines: Sequence[str] = (),
+    project_root: Optional[Path] = None,
+    calc_timeout_seconds: int = DEFAULT_CALC_TIMEOUT_SECONDS,
+) -> CustomBotPlan:
     switches = _available_switches(request)
     if not switches:
         return _fallback_plan(request, "no legal switch targets", rng)
-    actions = [
-        _scored_action(
-            choice,
-            label,
-            max(0.01, _condition_hp_fraction(pokemon.get("condition")) or 0.0) * 100.0,
-            "forced switch",
-        )
-        for choice, label, pokemon in switches
-    ]
+    opponent_moves = _revealed_opponent_moves(context, public_lines)[:4] if context else []
+    actions: List[ScoredAction] = []
+    for choice, label, pokemon in switches:
+        if opponent is not None and project_root is not None:
+            score = _switch_candidate_score(
+                pokemon=pokemon,
+                opponent=opponent,
+                opponent_moves=opponent_moves,
+                project_root=project_root,
+                calc_timeout_seconds=calc_timeout_seconds,
+            )
+            reason = "forced switch matchup"
+        else:
+            score = max(0.01, _condition_hp_fraction(pokemon.get("condition")) or 0.0) * 100.0
+            reason = "forced switch"
+        actions.append(_scored_action(choice, label, max(0.01, score), reason))
     decision = _choose_weighted(actions, rng)
     return CustomBotPlan(
         decision=decision,
@@ -599,30 +626,77 @@ def _voluntary_switch_scores(
     if not switches:
         return []
     best_existing = max((action.score for action in existing_scores), default=0.0)
-    if best_existing >= 35.0 and best_damage_score >= 25.0:
+    if best_existing >= 45.0 or (best_existing >= 35.0 and best_damage_score >= 20.0):
         return []
 
     opponent_moves = _revealed_opponent_moves(context, public_lines)[:4]
+    if not opponent_moves and best_existing >= 20.0:
+        return []
+    after_forced_switch = _active_entered_after_own_faint(context, public_lines, own_active.ident)
     scores: List[ScoredAction] = []
     for choice, label, pokemon in switches:
-        hp_fraction = _condition_hp_fraction(pokemon.get("condition")) or 0.0
-        switch_score = hp_fraction * 30.0
-        incoming = _worst_incoming_damage_pct(
+        raw_score = _switch_candidate_score(
+            pokemon=pokemon,
             opponent=opponent,
-            defender=_pokemon_state_from_side_slot(pokemon),
-            move_names=opponent_moves,
+            opponent_moves=opponent_moves,
             project_root=project_root,
             calc_timeout_seconds=calc_timeout_seconds,
         )
-        if incoming is not None:
-            switch_score += max(0.0, 70.0 - incoming)
+        if after_forced_switch:
+            if best_existing >= 10.0 or raw_score < 80.0:
+                continue
+            switch_score = raw_score * 0.35
         else:
-            switch_score += hp_fraction * 10.0
+            required_score = 30.0 if best_existing < 10.0 else max(45.0, best_existing + 12.0)
+            if raw_score < required_score:
+                continue
+            switch_score = raw_score * 0.65
         if (own_active.hp_fraction or 1.0) <= 0.20 and switch_score < best_existing + 25.0:
             continue
         if switch_score > 0:
             scores.append(_scored_action(choice, label, switch_score, "defensive pivot"))
     return scores
+
+
+def _switch_candidate_score(
+    *,
+    pokemon: Dict[str, Any],
+    opponent: PokemonState,
+    opponent_moves: Sequence[str],
+    project_root: Path,
+    calc_timeout_seconds: int,
+) -> float:
+    hp_fraction = _condition_hp_fraction(pokemon.get("condition")) or 0.0
+    if hp_fraction <= 0.0:
+        return 0.0
+    candidate = _pokemon_state_from_side_slot(pokemon)
+    score = hp_fraction * 25.0
+    incoming = _worst_incoming_damage_pct(
+        opponent=opponent,
+        defender=candidate,
+        move_names=opponent_moves,
+        project_root=project_root,
+        calc_timeout_seconds=calc_timeout_seconds,
+    )
+    if incoming is not None:
+        score += max(0.0, 90.0 - incoming) * 0.55
+    else:
+        score += hp_fraction * 8.0
+    outgoing = _best_outgoing_damage_pct(
+        attacker=candidate,
+        defender=opponent,
+        move_names=_known_pokemon_moves(pokemon),
+        project_root=project_root,
+        calc_timeout_seconds=calc_timeout_seconds,
+    )
+    if outgoing is not None:
+        score += min(100.0, outgoing) * 0.45
+    status = _condition_status(pokemon.get("condition"))
+    if status in {"slp", "frz"}:
+        score *= 0.45
+    elif status in MAJOR_STATUSES:
+        score *= 0.80
+    return score
 
 
 def _worst_incoming_damage_pct(
@@ -663,6 +737,53 @@ def _worst_incoming_damage_pct(
         if isinstance(range_percent, dict):
             worst = max(worst, _float_value(range_percent.get("max")) or 0.0)
     return worst if worst > 0 else None
+
+
+def _best_outgoing_damage_pct(
+    *,
+    attacker: PokemonState,
+    defender: PokemonState,
+    move_names: Sequence[str],
+    project_root: Path,
+    calc_timeout_seconds: int,
+) -> Optional[float]:
+    if not move_names:
+        return None
+    requests = [
+        {
+            "schema_version": CALC_REQUEST_SCHEMA_VERSION,
+            "generation": 1,
+            "attacker": attacker.calc_ref,
+            "defender": defender.calc_ref,
+            "move": {"name": move_name},
+            "field": {},
+        }
+        for move_name in move_names[:4]
+    ]
+    try:
+        response = run_damage_calc_batch(
+            {"schema_version": CALC_BATCH_REQUEST_SCHEMA_VERSION, "requests": requests},
+            project_root=project_root,
+            timeout_seconds=calc_timeout_seconds,
+        )
+    except ConfigError:
+        return None
+    best = 0.0
+    for result in response.get("results", []):
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            continue
+        payload = result.get("result")
+        range_percent = payload.get("range_percent") if isinstance(payload, dict) else None
+        if isinstance(range_percent, dict):
+            best = max(best, _float_value(range_percent.get("max")) or 0.0)
+    return best if best > 0 else None
+
+
+def _known_pokemon_moves(pokemon: Dict[str, Any]) -> List[str]:
+    moves = pokemon.get("moves")
+    if not isinstance(moves, list):
+        return []
+    return [str(move).strip() for move in moves if isinstance(move, str) and move.strip()]
 
 
 def _available_switches(request: Dict[str, Any]) -> List[tuple[str, str, Dict[str, Any]]]:
@@ -935,6 +1056,41 @@ def _revealed_opponent_moves(context: Dict[str, Any], public_lines: Sequence[str
                 seen.add(key)
                 moves.append(move_name)
     return moves
+
+
+def _active_entered_after_own_faint(
+    context: Dict[str, Any],
+    public_lines: Sequence[str],
+    own_ident: Optional[str],
+) -> bool:
+    if not own_ident:
+        return False
+    player_slot = _effective_player_slot(context)
+    last_own_event: Optional[str] = None
+    active_switch_after_faint = False
+    active_switch_seen = False
+    for line in public_lines:
+        parts = line.split("|") if isinstance(line, str) else []
+        if len(parts) < 3:
+            continue
+        event_type = parts[1]
+        actor = parts[2]
+        if not _ident_matches_slot(actor, player_slot):
+            continue
+        if event_type in {"switch", "drag", "replace"}:
+            if _same_ident(actor, own_ident):
+                active_switch_after_faint = last_own_event == "faint"
+                active_switch_seen = True
+            last_own_event = "switch"
+            continue
+        if event_type == "faint":
+            last_own_event = "faint"
+            continue
+        if event_type == "move":
+            if active_switch_seen and _same_ident(actor, own_ident):
+                active_switch_after_faint = False
+            last_own_event = "move"
+    return active_switch_after_faint
 
 
 def _heuristic_move_metadata(move_name: str, request_move: Dict[str, Any]) -> Dict[str, Any]:

@@ -423,6 +423,56 @@ class CustomBotTest(unittest.TestCase):
 
         self.assertIn("switch 2", {action.choice for action in plan.actions})
 
+    def test_switches_are_suppressed_without_known_threat_when_active_move_is_usable(self) -> None:
+        context = _context(
+            [{"move": "Surf", "id": "surf", "disabled": False}],
+            bench=[
+                {"ident": "p1: Jolteon", "details": "Jolteon, L80", "condition": "100/100"},
+                {"ident": "p1: Snorlax", "details": "Snorlax, L80", "condition": "100/100"},
+            ],
+        )
+        metadata = {"Surf": _metadata("Surf", base_power=95)}
+        ranges = {"Surf": (30, 35)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertNotIn("switch 2", {action.choice for action in plan.actions})
+        self.assertNotIn("switch 3", {action.choice for action in plan.actions})
+
+    def test_switches_are_suppressed_right_after_forced_switch_with_usable_move(self) -> None:
+        context = _context(
+            [{"move": "Blizzard", "id": "blizzard", "disabled": False}],
+            player_slot="p2",
+            side_id="p2",
+            own_species="Articuno",
+            opponent_species="Rhydon",
+            bench=[
+                {
+                    "ident": "p2: Vaporeon",
+                    "details": "Vaporeon, L74",
+                    "condition": "100/100",
+                    "moves": ["surf", "blizzard", "rest", "bodyslam"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Rhydon|Rhydon, L80|100/100",
+                "|switch|p2a: Drowzee|Drowzee, L84|0 fnt",
+                "|faint|p2a: Drowzee",
+                "|switch|p2a: Articuno|Articuno, L70|100/100",
+                "|turn|10",
+            ],
+        )
+        metadata = {"Blizzard": _metadata("Blizzard", base_power=120)}
+        ranges = {"Blizzard": (30, 35), "surf": (90, 100)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertIn("move 1", {action.choice for action in plan.actions})
+        self.assertNotIn("switch 2", {action.choice for action in plan.actions})
+
     def test_low_hp_active_can_still_be_sacrificed_without_clear_switch(self) -> None:
         context = _context(
             [{"move": "Tackle", "id": "tackle", "disabled": False}],
@@ -450,7 +500,7 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual(plan.decision, "move 1")
         self.assertEqual(plan.fallback_reason, "unsupported format or request kind")
 
-    def test_forced_switch_plan_scores_available_switches(self) -> None:
+    def test_forced_switch_plan_scores_available_switches_by_matchup(self) -> None:
         context = _context([])
         context["request_kind"] = "switch"
         context["request"] = {
@@ -458,13 +508,33 @@ class CustomBotTest(unittest.TestCase):
             "side": {
                 "pokemon": [
                     {"ident": "p1: Venusaur", "details": "Venusaur, L80", "condition": "0 fnt", "active": True},
-                    {"ident": "p1: Jolteon", "details": "Jolteon, L80", "condition": "90/100"},
-                    {"ident": "p1: Snorlax", "details": "Snorlax, L80", "condition": "40/100"},
+                    {
+                        "ident": "p1: Vaporeon",
+                        "details": "Vaporeon, L74",
+                        "condition": "100/100",
+                        "moves": ["surf", "blizzard", "rest", "bodyslam"],
+                    },
+                    {
+                        "ident": "p1: Lickitung",
+                        "details": "Lickitung, L80",
+                        "condition": "100/100",
+                        "moves": ["bodyslam", "stomp", "screech", "rest"],
+                    },
                 ]
             },
         }
+        context["side"] = context["request"]["side"]
+        context["recent_public_events"] = [
+            "|gen|1",
+            "|switch|p1a: Venusaur|Venusaur, L80|0 fnt",
+            "|faint|p1a: Venusaur",
+            "|switch|p2a: Rhydon|Rhydon, L80|100/100",
+            "|turn|8",
+        ]
+        ranges = {"surf": (95, 110), "blizzard": (30, 35), "bodyslam": (12, 16), "stomp": (10, 13)}
 
-        plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(10))
+        with _patched_calc({}, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(10))
 
         self.assertIn(plan.decision, {"switch 2", "switch 3"})
         self.assertGreater(
