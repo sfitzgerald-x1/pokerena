@@ -658,6 +658,47 @@ class CustomBotTest(unittest.TestCase):
         self.assertIn("move 1", {action.choice for action in plan.actions})
         self.assertNotIn("switch 2", {action.choice for action in plan.actions})
 
+    def test_active_boosts_downregulate_voluntary_switching(self) -> None:
+        common_events = [
+            "|gen|1",
+            "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+            "|switch|p2a: Starmie|Starmie, L80|100/100",
+            "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+            "|move|p2a: Starmie|Surf|p1a: Venusaur",
+            "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+            "|move|p2a: Starmie|Surf|p1a: Venusaur",
+            "|turn|3",
+        ]
+        unboosted = _context(
+            [{"move": "Tackle", "id": "tackle", "disabled": False}],
+            bench=[
+                {"ident": "p1: Jolteon", "details": "Jolteon, L80", "condition": "100/100"},
+            ],
+            recent_public_events=common_events,
+        )
+        boosted = _context(
+            [{"move": "Tackle", "id": "tackle", "disabled": False}],
+            bench=[
+                {"ident": "p1: Jolteon", "details": "Jolteon, L80", "condition": "100/100"},
+            ],
+            recent_public_events=[
+                common_events[0],
+                common_events[1],
+                common_events[2],
+                "|-boost|p1a: Venusaur|atk|2",
+                *common_events[3:],
+            ],
+        )
+        metadata = {"Tackle": _metadata("Tackle", base_power=40)}
+        ranges = {"Tackle": (12, 15), "Surf": (50, 50)}
+
+        with _patched_calc(metadata, ranges):
+            unboosted_plan = build_custom_bot_plan(unboosted, project_root=Path.cwd(), rng=random.Random(7))
+            boosted_plan = build_custom_bot_plan(boosted, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertIn("switch 2", {action.choice for action in unboosted_plan.actions})
+        self.assertNotIn("switch 2", {action.choice for action in boosted_plan.actions})
+
     def test_low_hp_active_can_still_be_sacrificed_without_clear_switch(self) -> None:
         context = _context(
             [{"move": "Tackle", "id": "tackle", "disabled": False}],

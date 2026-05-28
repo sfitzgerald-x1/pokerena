@@ -213,6 +213,7 @@ def build_custom_bot_plan(
         public_lines=public_lines,
         existing_scores=action_scores,
         best_damage_score=best_damage_score,
+        own_boosts=own_boosts,
         project_root=root,
         calc_timeout_seconds=calc_timeout_seconds,
     )
@@ -629,6 +630,10 @@ def _boosts_are_capped(boosts: Dict[str, Any], own_boosts: Dict[str, int]) -> bo
     return checked
 
 
+def _has_positive_boost(boosts: Dict[str, int]) -> bool:
+    return any(value > 0 for value in boosts.values())
+
+
 def _voluntary_switch_scores(
     *,
     context: Dict[str, Any],
@@ -638,6 +643,7 @@ def _voluntary_switch_scores(
     public_lines: Sequence[str],
     existing_scores: Sequence[ScoredAction],
     best_damage_score: float,
+    own_boosts: Dict[str, int],
     project_root: Path,
     calc_timeout_seconds: int,
 ) -> List[ScoredAction]:
@@ -654,6 +660,7 @@ def _voluntary_switch_scores(
     if _own_active_move_count_since_switch(context, public_lines, own_active.ident) < 2 and best_existing > 0:
         return []
     after_forced_switch = _active_entered_after_own_faint(context, public_lines, own_active.ident)
+    boosted_active = _has_positive_boost(own_boosts)
     scores: List[ScoredAction] = []
     for choice, label, pokemon in switches:
         raw_score = _switch_candidate_score(
@@ -669,13 +676,18 @@ def _voluntary_switch_scores(
             switch_score = raw_score * 0.35
         else:
             required_score = 30.0 if best_existing < 10.0 else max(45.0, best_existing + 12.0)
+            if boosted_active:
+                required_score = max(required_score + 20.0, best_existing + 30.0, 60.0)
             if raw_score < required_score:
                 continue
             switch_score = raw_score * 0.65
+            if boosted_active:
+                switch_score *= 0.35
         if (own_active.hp_fraction or 1.0) <= 0.20 and switch_score < best_existing + 25.0:
             continue
         if switch_score > 0:
-            scores.append(_scored_action(choice, label, switch_score, "defensive pivot"))
+            reason = "defensive pivot despite active boosts" if boosted_active else "defensive pivot"
+            scores.append(_scored_action(choice, label, switch_score, reason))
     return scores
 
 
