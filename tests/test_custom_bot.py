@@ -8,6 +8,7 @@ from unittest import mock
 from pokerena.config import ConfigError
 from pokerena.custom_bot import (
     _choose_weighted,
+    _effective_player_slot,
     _revealed_opponent_moves,
     _scored_action,
     _sleep_clause_active,
@@ -148,6 +149,43 @@ class CustomBotTest(unittest.TestCase):
 
         self.assertEqual(plan.actions, [])
         self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
+
+    def test_status_scoring_uses_request_side_when_context_slot_is_stale(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Stun Spore", "id": "stunspore", "disabled": False},
+            ],
+            player_slot="p1",
+            side_id="p2",
+            own_species="Butterfree",
+            opponent_species="Exeggcute",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Exeggcute|Exeggcute, L84|100/100",
+                "|switch|p2a: Butterfree|Butterfree, L77|100/100",
+                "|-status|p1a: Exeggcute|par",
+                "|turn|10",
+            ],
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Stun Spore": _metadata(
+                "Stun Spore",
+                category="Status",
+                base_power=0,
+                accuracy=75,
+                status="par",
+            ),
+        }
+        ranges = {"Tackle": (12, 16)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(13))
+
+        self.assertEqual(_effective_player_slot(context), "p2")
+        self.assertIn("move 1", {action.choice for action in plan.actions})
+        self.assertNotIn("move 2", {action.choice for action in plan.actions})
 
     def test_hyper_beam_is_penalized_when_it_does_not_ko(self) -> None:
         context = _context(
@@ -403,14 +441,18 @@ def _context(
     moves: list[dict],
     *,
     format_name: str = "gen1randombattle",
+    player_slot: str = "p1",
+    side_id: str = "p1",
+    own_species: str = "Venusaur",
+    opponent_species: str = "Starmie",
     active_condition: str = "100/100",
     bench: list[dict] | None = None,
     recent_public_events: list[str] | None = None,
 ) -> dict:
     side_pokemon = [
         {
-            "ident": "p1: Venusaur",
-            "details": "Venusaur, L80",
+            "ident": f"{side_id}: {own_species}",
+            "details": f"{own_species}, L80",
             "condition": active_condition,
             "active": True,
             "stats": {"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 180},
@@ -419,14 +461,15 @@ def _context(
     side_pokemon.extend(bench or [])
     request = {
         "active": [{"moves": moves}],
-        "side": {"pokemon": side_pokemon},
+        "side": {"id": side_id, "pokemon": side_pokemon},
     }
+    opponent_slot = "p2" if side_id == "p1" else "p1"
     return {
         "schema_version": "pokerena.turn-context.v1",
         "battle_id": "battle-gen1",
         "agent_id": "custom",
         "provider": "pokerena-custom-bot",
-        "player_slot": "p1",
+        "player_slot": player_slot,
         "context_token": "battle-gen1:p1:1:1",
         "format_name": format_name,
         "turn_number": 1,
@@ -443,8 +486,8 @@ def _context(
         "recent_public_events": recent_public_events
         or [
             "|gen|1",
-            "|switch|p1a: Venusaur|Venusaur, L80|100/100",
-            "|switch|p2a: Starmie|Starmie, L80|100/100",
+            f"|switch|{side_id}a: {own_species}|{own_species}, L80|100/100",
+            f"|switch|{opponent_slot}a: {opponent_species}|{opponent_species}, L80|100/100",
             "|turn|1",
         ],
         "last_error": None,

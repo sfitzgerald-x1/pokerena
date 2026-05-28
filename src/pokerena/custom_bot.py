@@ -741,7 +741,7 @@ def _active_opponent_from_public_history(
     context: Dict[str, Any],
     public_lines: Sequence[str],
 ) -> Optional[PokemonState]:
-    opponent_prefix = _opponent_slot(str(context.get("player_slot") or "p1"))
+    opponent_prefix = _opponent_slot(_effective_player_slot(context))
     active: Optional[PokemonState] = None
     for line in public_lines:
         if not isinstance(line, str):
@@ -808,7 +808,7 @@ def _public_lines(context: Dict[str, Any], capture_payload: Optional[Dict[str, A
 
 
 def _sleep_clause_active(context: Dict[str, Any], public_lines: Sequence[str]) -> bool:
-    player_slot = str(context.get("player_slot") or "p1")
+    player_slot = _effective_player_slot(context)
     opponent_slot = _opponent_slot(player_slot)
     asleep: Dict[str, bool] = {}
     last_move: Optional[tuple[str, str, str]] = None
@@ -879,7 +879,7 @@ def _boosts_for_active(
 
 
 def _revealed_opponent_moves(context: Dict[str, Any], public_lines: Sequence[str]) -> List[str]:
-    opponent_slot = _opponent_slot(str(context.get("player_slot") or "p1"))
+    opponent_slot = _opponent_slot(_effective_player_slot(context))
     moves: List[str] = []
     seen: set[str] = set()
     for line in public_lines:
@@ -996,6 +996,16 @@ def _condition_status(condition: Any) -> Optional[str]:
 
 def _opponent_slot(player_slot: str) -> str:
     return "p2" if player_slot.startswith("p1") else "p1"
+
+
+def _effective_player_slot(context: Dict[str, Any]) -> str:
+    side = _context_side(context)
+    if isinstance(side, dict):
+        side_id = side.get("id")
+        if isinstance(side_id, str) and side_id in {"p1", "p2"}:
+            return side_id
+    player_slot = str(context.get("player_slot") or "p1")
+    return "p2" if player_slot.startswith("p2") else "p1"
 
 
 def _ident_matches_slot(ident: str, slot: str) -> bool:
