@@ -231,8 +231,11 @@ function calculateDamageBatch(payload) {
   };
 }
 
-function showdownDex() {
-  const showdownPath = path.join(process.cwd(), 'vendor', 'pokemon-showdown');
+function showdownDex(projectRoot) {
+  const root = projectRoot
+    ? path.resolve(projectRoot)
+    : path.resolve(__dirname, '..');
+  const showdownPath = path.join(root, 'vendor', 'pokemon-showdown');
   try {
     const {Dex} = require(showdownPath);
     return Dex;
@@ -267,8 +270,9 @@ function describeMoveMetadataBatch(payload) {
   if (!Array.isArray(data.moves) || data.moves.length < 1) {
     fail('moves must be a non-empty array.');
   }
+  const projectRoot = data.project_root === undefined ? null : requireString(data.project_root, 'project_root');
 
-  const dex = showdownDex().mod(`gen${generation}`);
+  const dex = showdownDex(projectRoot).mod(`gen${generation}`);
   return {
     schema_version: MOVE_METADATA_RESULT_SCHEMA_VERSION,
     generation,

@@ -307,6 +307,7 @@ def describe_move_metadata(
             "schema_version": CALC_MOVE_METADATA_REQUEST_SCHEMA_VERSION,
             "generation": generation,
             "moves": normalized_names,
+            "project_root": str(project_root),
         },
         project_root=project_root,
         timeout_seconds=timeout_seconds,

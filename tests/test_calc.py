@@ -150,6 +150,7 @@ class DamageCalcTest(unittest.TestCase):
         self.assertEqual(result["moves"][0]["status"], "par")
         self.assertTrue(result["moves"][1]["high_crit"])
         self.assertEqual(worker.call_args.kwargs["command"], "move-metadata-batch")
+        self.assertEqual(worker.call_args.kwargs["payload"]["project_root"], str(root))
 
     def test_send_worker_request_enforces_hard_deadline_after_partial_response(self) -> None:
         class _FakeSocket:

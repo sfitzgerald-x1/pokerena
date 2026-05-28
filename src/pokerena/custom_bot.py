@@ -1,11 +1,20 @@
+"""Baseline heuristic Gen 1 random battle bot.
+
+This is intentionally a stateless, beginner-to-intermediate strength bot rather
+than a solved Gen 1 engine. It values damage, status, setup, and obvious pivots,
+but it is still weak to meta-heavy lines such as Wrap locks, Evasion abuse, and
+long-term sacrifice planning.
+"""
+
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
 import random
 import re
+import sys
 from typing import Any, Dict, List, Optional, Sequence
 
 from .agent import AgentDecision, choose_first_legal, choose_random_legal
@@ -42,6 +51,13 @@ class CustomBotPlan:
     notes: str
     actions: List[ScoredAction]
     fallback_reason: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DamageBatchResult:
+    results: Dict[str, Dict[str, Any]]
+    warning: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +109,8 @@ def decide_custom_bot_from_files(
         rng=rng,
         calc_timeout_seconds=calc_timeout_seconds,
     )
+    for warning in plan.warnings or []:
+        print(warning, file=sys.stderr)
     return AgentDecision(
         schema_version="pokerena.decision.v1",
         decision=plan.decision,
@@ -148,12 +166,15 @@ def build_custom_bot_plan(
         project_root=root,
         calc_timeout_seconds=calc_timeout_seconds,
     )
+    damage_warnings = [
+        damage_results.warning,
+    ] if damage_results.warning else []
     sleep_clause_active = _sleep_clause_active(context, public_lines)
     own_boosts = _boosts_for_active(context, public_lines, own_active.ident)
     action_scores: List[ScoredAction] = []
     best_damage_score = 0.0
     for candidate in move_candidates:
-        damage_result = damage_results.get(candidate.choice)
+        damage_result = damage_results.results.get(candidate.choice)
         if damage_result is not None:
             score, reason = _score_damaging_move(candidate, damage_result, opponent)
             score = _add_secondary_status_value(score, candidate, opponent)
@@ -182,11 +203,16 @@ def build_custom_bot_plan(
     )
     action_scores.extend(switch_scores)
     if not action_scores:
-        return _fallback_plan(request, "all heuristic scores were zero", chooser)
+        return _fallback_plan(
+            request,
+            "all heuristic scores were zero",
+            chooser,
+            warnings=damage_warnings,
+        )
 
     decision = _choose_weighted(action_scores, chooser)
-    notes = _notes(decision, action_scores, fallback_reason=None)
-    return CustomBotPlan(decision=decision, notes=notes, actions=action_scores)
+    notes = _notes(decision, action_scores, fallback_reason=None, warnings=damage_warnings)
+    return CustomBotPlan(decision=decision, notes=notes, actions=action_scores, warnings=damage_warnings)
 
 
 def _forced_switch_plan(request: Dict[str, Any], rng: random.Random) -> CustomBotPlan:
@@ -203,17 +229,30 @@ def _forced_switch_plan(request: Dict[str, Any], rng: random.Random) -> CustomBo
         for choice, label, pokemon in switches
     ]
     decision = _choose_weighted(actions, rng)
-    return CustomBotPlan(decision=decision, notes=_notes(decision, actions, fallback_reason=None), actions=actions)
+    return CustomBotPlan(
+        decision=decision,
+        notes=_notes(decision, actions, fallback_reason=None),
+        actions=actions,
+    )
 
 
 def _fallback_plan(
     request: Optional[Dict[str, Any]],
     reason: str,
     rng: random.Random,
+    *,
+    warnings: Optional[List[str]] = None,
 ) -> CustomBotPlan:
     decision = choose_random_legal(request, rng=rng) if request is not None else choose_first_legal(request)
-    notes = f"custom-bot fallback: {reason}; selected {decision}."
-    return CustomBotPlan(decision=decision, notes=notes, actions=[], fallback_reason=reason)
+    warning_prefix = " ".join(warnings or [])
+    notes = f"{warning_prefix} custom-bot fallback: {reason}; selected {decision}.".strip()
+    return CustomBotPlan(
+        decision=decision,
+        notes=notes,
+        actions=[],
+        fallback_reason=reason,
+        warnings=list(warnings or []),
+    )
 
 
 def _is_supported_gen1_randbat(context: Dict[str, Any]) -> bool:
@@ -299,7 +338,7 @@ def _damage_results_by_choice(
     defender: PokemonState,
     project_root: Path,
     calc_timeout_seconds: int,
-) -> Dict[str, Dict[str, Any]]:
+) -> DamageBatchResult:
     requests: List[Dict[str, Any]] = []
     choices: List[str] = []
     for candidate in candidates:
@@ -317,23 +356,32 @@ def _damage_results_by_choice(
         )
         choices.append(candidate.choice)
     if not requests:
-        return {}
+        return DamageBatchResult(results={})
     try:
         response = run_damage_calc_batch(
             {"schema_version": CALC_BATCH_REQUEST_SCHEMA_VERSION, "requests": requests},
             project_root=project_root,
             timeout_seconds=calc_timeout_seconds,
         )
-    except ConfigError:
-        return {}
+    except ConfigError as error:
+        return DamageBatchResult(
+            results={},
+            warning=(
+                "custom-bot warning: damage calc batch failed; damaging moves are "
+                f"using generic utility fallback ({error})."
+            ),
+        )
     results = response.get("results")
     if not isinstance(results, list):
-        return {}
+        return DamageBatchResult(
+            results={},
+            warning="custom-bot warning: damage calc batch returned an invalid result shape.",
+        )
     mapped: Dict[str, Dict[str, Any]] = {}
     for choice, result in zip(choices, results):
         if isinstance(result, dict) and result.get("status") == "ok" and isinstance(result.get("result"), dict):
             mapped[choice] = result["result"]
-    return mapped
+    return DamageBatchResult(results=mapped)
 
 
 def _score_damaging_move(
@@ -347,6 +395,8 @@ def _score_damaging_move(
     min_pct = _float_value(range_percent.get("min")) or 0.0
     max_pct = _float_value(range_percent.get("max")) or 0.0
     target_hp_pct = 100.0 * (opponent.hp_fraction if opponent.hp_fraction is not None else 1.0)
+    # This intentionally uses the calc range midpoint as a lightweight approximation
+    # rather than modeling Gen 1's exact 217-255 damage roll distribution.
     expected_pct = (min_pct + max_pct) / 2.0
     score = min(expected_pct, target_hp_pct) * _accuracy_factor(candidate.metadata)
     if min_pct >= target_hp_pct:
@@ -356,12 +406,34 @@ def _score_damaging_move(
     if bool(candidate.metadata.get("high_crit")):
         score *= 1.05
     move_id = _metadata_id(candidate.metadata)
-    if move_id == "hyperbeam" and max_pct < target_hp_pct:
-        score *= 0.35
+    if move_id == "hyperbeam":
+        hyper_beam_multiplier = _hyper_beam_recharge_risk_multiplier(
+            min_pct=min_pct,
+            max_pct=max_pct,
+            target_hp_pct=target_hp_pct,
+        )
+        score *= hyper_beam_multiplier
     if bool(candidate.metadata.get("charge")) or move_id in CHARGE_MOVE_IDS:
         score *= 0.45
     reason = f"damage {min_pct:.1f}-{max_pct:.1f}%"
     return max(0.0, score), reason
+
+
+def _hyper_beam_recharge_risk_multiplier(
+    *,
+    min_pct: float,
+    max_pct: float,
+    target_hp_pct: float,
+) -> float:
+    if min_pct >= target_hp_pct:
+        return 1.0
+    if max_pct <= target_hp_pct:
+        return 0.35
+    roll_span = max_pct - min_pct
+    if roll_span <= 0:
+        return 0.35
+    non_ko_fraction = max(0.0, min(1.0, (target_hp_pct - min_pct) / roll_span))
+    return 1.0 - (non_ko_fraction * 0.65)
 
 
 def _add_secondary_status_value(
@@ -424,7 +496,9 @@ def _status_base_value(status: str, sleep_clause_active: bool) -> float:
         return 0.0 if sleep_clause_active else 90.0
     if status == "par":
         return 70.0
-    if status in {"psn", "tox", "brn", "frz"}:
+    if status == "frz":
+        return 88.0
+    if status in {"psn", "tox", "brn"}:
         return 45.0
     return 20.0
 
@@ -448,7 +522,7 @@ def _boost_score(
     if "spe" in boosts:
         return 45.0 * hp_fraction if hp_fraction >= 0.45 else 8.0 * hp_fraction
     if "evasion" in boosts:
-        return 30.0 * hp_fraction
+        return 75.0 * hp_fraction if hp_fraction >= 0.40 else 18.0 * hp_fraction
     return 35.0 * hp_fraction
 
 
@@ -601,7 +675,12 @@ def _scored_action(choice: str, label: str, score: float, reason: str) -> Scored
     )
 
 
-def _notes(decision: str, actions: Sequence[ScoredAction], fallback_reason: Optional[str]) -> str:
+def _notes(
+    decision: str,
+    actions: Sequence[ScoredAction],
+    fallback_reason: Optional[str],
+    warnings: Optional[Sequence[str]] = None,
+) -> str:
     if fallback_reason:
         return f"custom-bot fallback: {fallback_reason}; selected {decision}."
     total_weight = sum(action.weight for action in actions)
@@ -613,7 +692,9 @@ def _notes(decision: str, actions: Sequence[ScoredAction], fallback_reason: Opti
             f"{action.choice} {action.label}: score={action.score:.1f}, "
             f"p={probability:.0f}%, {action.reason}"
         )
-    return f"custom-bot gen1randombattle weighted scores; selected {decision}. " + "; ".join(parts)
+    warning_text = " ".join(warnings or [])
+    score_text = f"custom-bot gen1randombattle weighted scores; selected {decision}. " + "; ".join(parts)
+    return f"{warning_text} {score_text}".strip()
 
 
 def _active_side_pokemon(side: Optional[Dict[str, Any]]) -> Optional[PokemonState]:
