@@ -227,6 +227,9 @@ def build_custom_bot_plan(
                 has_ko_line=has_ko_line,
                 project_root=root,
             )
+        if score > 0 and own_active.status == "slp":
+            score *= 0.20
+            reason = f"{reason}; active asleep"
         if score > 0:
             action_scores.append(_scored_action(candidate.choice, candidate.name, score, reason))
 
@@ -786,13 +789,18 @@ def _voluntary_switch_scores(
     if not switches:
         return []
     best_existing = max((action.score for action in existing_scores), default=0.0)
-    if best_existing >= 45.0 or (best_existing >= 35.0 and best_damage_score >= 20.0):
+    active_asleep = own_active.status == "slp"
+    if not active_asleep and (best_existing >= 45.0 or (best_existing >= 35.0 and best_damage_score >= 20.0)):
         return []
 
     opponent_moves = _revealed_opponent_moves(context, public_lines)[:4]
-    if not opponent_moves and best_existing >= 20.0:
+    if not active_asleep and not opponent_moves and best_existing >= 20.0:
         return []
-    if _own_active_move_count_since_switch(context, public_lines, own_active.ident) < 2 and best_existing > 0:
+    if (
+        not active_asleep
+        and _own_active_move_count_since_switch(context, public_lines, own_active.ident) < 2
+        and best_existing > 0
+    ):
         return []
     after_forced_switch = _active_entered_after_own_faint(context, public_lines, own_active.ident)
     boosted_active = _has_positive_boost(own_boosts)
@@ -805,7 +813,12 @@ def _voluntary_switch_scores(
             project_root=project_root,
             calc_timeout_seconds=calc_timeout_seconds,
         )
-        if after_forced_switch:
+        if active_asleep:
+            required_score = max(10.0, best_existing * 0.25)
+            if raw_score < required_score:
+                continue
+            switch_score = raw_score * 1.25 + 25.0
+        elif after_forced_switch:
             if best_existing >= 10.0 or raw_score < 80.0:
                 continue
             switch_score = raw_score * 0.35
@@ -818,10 +831,13 @@ def _voluntary_switch_scores(
             switch_score = raw_score * 0.65
             if boosted_active:
                 switch_score *= 0.35
-        if (own_active.hp_fraction or 1.0) <= 0.20 and switch_score < best_existing + 25.0:
+        if not active_asleep and (own_active.hp_fraction or 1.0) <= 0.20 and switch_score < best_existing + 25.0:
             continue
         if switch_score > 0:
-            reason = "defensive pivot despite active boosts" if boosted_active else "defensive pivot"
+            if active_asleep:
+                reason = "sleep-clause pivot"
+            else:
+                reason = "defensive pivot despite active boosts" if boosted_active else "defensive pivot"
             scores.append(_scored_action(choice, label, switch_score, reason))
     return scores
 
@@ -860,7 +876,9 @@ def _switch_candidate_score(
     if outgoing is not None:
         score += min(100.0, outgoing) * 0.45
     status = _condition_status(pokemon.get("condition"))
-    if status in {"slp", "frz"}:
+    if status == "slp":
+        score *= 0.15
+    elif status == "frz":
         score *= 0.45
     elif status in MAJOR_STATUSES:
         score *= 0.80

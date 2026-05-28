@@ -849,6 +849,74 @@ class CustomBotTest(unittest.TestCase):
         self.assertNotIn("switch 2", {action.choice for action in plan.actions})
         self.assertNotIn("switch 3", {action.choice for action in plan.actions})
 
+    def test_sleeping_active_prioritizes_switching_out(self) -> None:
+        context = _context(
+            [{"move": "Thunderbolt", "id": "thunderbolt", "disabled": False}],
+            own_species="Gengar",
+            opponent_species="Starmie",
+            active_condition="100/100 slp",
+            bench=[
+                {
+                    "ident": "p1: Snorlax",
+                    "details": "Snorlax, L80",
+                    "condition": "100/100",
+                    "moves": ["bodyslam"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Gengar|Gengar, L80|100/100 slp",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|turn|4",
+            ],
+        )
+        metadata = {"Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric")}
+        ranges = {"Thunderbolt": (60, 70), "bodyslam": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertEqual(plan.actions[0].reason, "sleep-clause pivot")
+
+    def test_sleeping_switch_candidate_is_deprioritized(self) -> None:
+        context = _context([])
+        context["request_kind"] = "switch"
+        context["request"] = {
+            "forceSwitch": [True],
+            "side": {
+                "pokemon": [
+                    {"ident": "p1: Venusaur", "details": "Venusaur, L80", "condition": "0 fnt", "active": True},
+                    {
+                        "ident": "p1: Vaporeon",
+                        "details": "Vaporeon, L74",
+                        "condition": "100/100",
+                        "moves": ["surf"],
+                    },
+                    {
+                        "ident": "p1: Tauros",
+                        "details": "Tauros, L80",
+                        "condition": "100/100 slp",
+                        "moves": ["hyperbeam"],
+                    },
+                ]
+            },
+        }
+        context["side"] = context["request"]["side"]
+        context["recent_public_events"] = [
+            "|gen|1",
+            "|switch|p1a: Venusaur|Venusaur, L80|0 fnt",
+            "|faint|p1a: Venusaur",
+            "|switch|p2a: Rhydon|Rhydon, L80|100/100",
+            "|turn|8",
+        ]
+        ranges = {"surf": (95, 110), "hyperbeam": (120, 130)}
+
+        with _patched_calc({}, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(10))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+
     def test_switches_are_suppressed_right_after_forced_switch_with_usable_move(self) -> None:
         context = _context(
             [{"move": "Blizzard", "id": "blizzard", "disabled": False}],
