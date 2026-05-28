@@ -6,7 +6,7 @@ import textwrap
 import unittest
 from unittest import mock
 
-from pokerena.agent import AgentContextCursor, AgentTimeoutError, BattleSession, DecisionPolicy, save_capture
+from pokerena.agent import AgentContextCursor, AgentDecision, AgentTimeoutError, BattleSession, DecisionPolicy, save_capture
 from pokerena.cli import (
     _decide_or_fallback,
     _selected_action_label,
@@ -126,6 +126,35 @@ class CLITest(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertIn("node", buffer.getvalue())
+
+    def test_agent_custom_bot_command_prints_decision_json(self) -> None:
+        decision = AgentDecision(
+            schema_version="pokerena.decision.v1",
+            decision="move 1",
+            notes="scored",
+            raw_output="",
+        )
+        with (
+            mock.patch("pokerena.cli.detect_project_root", return_value=Path.cwd()),
+            mock.patch("pokerena.cli.decide_custom_bot_from_files", return_value=decision) as decide,
+            mock.patch("sys.stdout", new=StringIO()) as buffer,
+        ):
+            code = main(
+                [
+                    "agent",
+                    "custom-bot",
+                    "--context",
+                    "turn-context.json",
+                    "--capture",
+                    "capture.json",
+                    "--seed",
+                    "7",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn('"decision":"move 1"', buffer.getvalue())
+        self.assertEqual(decide.call_args.kwargs["seed"], "7")
 
     def test_server_up_starts_callable_agents_and_shuts_them_down(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
