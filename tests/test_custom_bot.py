@@ -217,6 +217,68 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
         self.assertNotEqual(plan.decision, "move 2")
 
+    def test_confuse_ray_scores_zero_when_target_already_confused(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Confuse Ray", "id": "confuseray", "disabled": False},
+            ],
+            opponent_species="Hypno",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Golbat|Golbat, L80|100/100",
+                "|switch|p2a: Hypno|Hypno, L80|100/100",
+                "|-start|p2a: Hypno|confusion",
+                "|turn|2",
+            ],
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Confuse Ray": _metadata(
+                "Confuse Ray",
+                category="Status",
+                base_power=0,
+                accuracy=100,
+                volatile_status="confusion",
+            ),
+        }
+        ranges = {"Tackle": (12, 15)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(4))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+        self.assertNotEqual(plan.decision, "move 2")
+
+    def test_confuse_ray_scores_after_confusion_ends(self) -> None:
+        context = _context(
+            [{"move": "Confuse Ray", "id": "confuseray", "disabled": False}],
+            opponent_species="Hypno",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Golbat|Golbat, L80|100/100",
+                "|switch|p2a: Hypno|Hypno, L80|100/100",
+                "|-start|p2a: Hypno|confusion",
+                "|-end|p2a: Hypno|confusion",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Confuse Ray": _metadata(
+                "Confuse Ray",
+                category="Status",
+                base_power=0,
+                accuracy=100,
+                volatile_status="confusion",
+            )
+        }
+
+        with _patched_calc(metadata, {}):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(4))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+        self.assertEqual(plan.actions[0].reason, "confusion pressure")
+
     def test_status_scoring_uses_request_side_when_context_slot_is_stale(self) -> None:
         context = _context(
             [
@@ -739,6 +801,7 @@ def _metadata(
     base_power: int = 50,
     accuracy: int | bool = 100,
     status: str | None = None,
+    volatile_status: str | None = None,
     boosts: dict | None = None,
     secondary: dict | None = None,
     recharge: bool = False,
@@ -753,7 +816,7 @@ def _metadata(
         "base_power": base_power,
         "accuracy": accuracy,
         "status": status,
-        "volatile_status": None,
+        "volatile_status": volatile_status,
         "boosts": boosts or {},
         "self": {},
         "flags": {},

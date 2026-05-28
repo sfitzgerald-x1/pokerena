@@ -69,6 +69,7 @@ class PokemonState:
     calc_ref: Dict[str, Any]
     hp_fraction: Optional[float]
     status: Optional[str]
+    volatile_statuses: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -525,6 +526,8 @@ def _score_status_or_utility_move(
     if volatile_status == "leechseed" and opponent.status not in MAJOR_STATUSES:
         return 40.0 * _accuracy_factor(metadata), "Leech Seed pressure"
     if volatile_status == "confusion":
+        if _has_volatile_status(opponent, "confusion"):
+            return 0.0, "target already confused"
         return 35.0 * _accuracy_factor(metadata), "confusion pressure"
     if volatile_status in {"reflect", "lightscreen"}:
         return (35.0 * hp_fraction) if hp_fraction >= 0.35 else 5.0, volatile_status
@@ -925,6 +928,9 @@ def _pokemon_state_from_side_slot(pokemon: Dict[str, Any]) -> PokemonState:
         calc_ref=calc_ref,
         hp_fraction=_condition_hp_fraction(condition),
         status=_condition_status(condition),
+        volatile_statuses=_volatile_statuses_from_value(
+            pokemon.get("volatile_status") if "volatile_status" in pokemon else pokemon.get("volatiles")
+        ),
     )
 
 
@@ -960,6 +966,7 @@ def _active_opponent_from_public_history(
                     calc_ref=calc_ref,
                     hp_fraction=_condition_hp_fraction(condition),
                     status=_condition_status(condition),
+                    volatile_statuses=(),
                 )
             continue
         if active is None or len(parts) < 4:
@@ -972,13 +979,53 @@ def _active_opponent_from_public_history(
                 calc_ref=active.calc_ref,
                 hp_fraction=_condition_hp_fraction(condition),
                 status=_condition_status(condition) or active.status,
+                volatile_statuses=active.volatile_statuses,
             )
         elif parts[1] == "-status" and _same_ident(parts[2], active.ident):
-            active = PokemonState(active.species, active.ident, active.calc_ref, active.hp_fraction, parts[3])
+            active = PokemonState(
+                active.species,
+                active.ident,
+                active.calc_ref,
+                active.hp_fraction,
+                parts[3],
+                active.volatile_statuses,
+            )
         elif parts[1] == "-curestatus" and _same_ident(parts[2], active.ident):
-            active = PokemonState(active.species, active.ident, active.calc_ref, active.hp_fraction, None)
+            active = PokemonState(
+                active.species,
+                active.ident,
+                active.calc_ref,
+                active.hp_fraction,
+                None,
+                active.volatile_statuses,
+            )
         elif parts[1] == "faint" and _same_ident(parts[2], active.ident):
-            active = PokemonState(active.species, active.ident, active.calc_ref, 0.0, active.status)
+            active = PokemonState(
+                active.species,
+                active.ident,
+                active.calc_ref,
+                0.0,
+                active.status,
+                active.volatile_statuses,
+            )
+        elif parts[1] == "-start" and _same_ident(parts[2], active.ident):
+            active = PokemonState(
+                active.species,
+                active.ident,
+                active.calc_ref,
+                active.hp_fraction,
+                active.status,
+                _add_volatile_status(active.volatile_statuses, parts[3]),
+            )
+        elif parts[1] == "-end" and _same_ident(parts[2], active.ident):
+            active = PokemonState(
+                active.species,
+                active.ident,
+                active.calc_ref,
+                active.hp_fraction,
+                active.status,
+                _remove_volatile_status(active.volatile_statuses, parts[3]),
+            )
     return active
 
 
@@ -1303,6 +1350,44 @@ def _condition_status(condition: Any) -> Optional[str]:
         if token in MAJOR_STATUSES:
             return token
     return None
+
+
+def _volatile_statuses_from_value(value: Any) -> tuple[str, ...]:
+    statuses: List[str] = []
+    if isinstance(value, str):
+        statuses = [value]
+    elif isinstance(value, list):
+        statuses = [item for item in value if isinstance(item, str)]
+    elif isinstance(value, dict):
+        statuses = [key for key in value if isinstance(key, str)]
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for status in statuses:
+        key = _normalize_move_id(status)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return tuple(normalized)
+
+
+def _has_volatile_status(pokemon: PokemonState, status: str) -> bool:
+    return _normalize_move_id(status) in pokemon.volatile_statuses
+
+
+def _add_volatile_status(existing: Sequence[str], status: str) -> tuple[str, ...]:
+    key = _normalize_move_id(status)
+    if not key:
+        return tuple(existing)
+    values = list(existing)
+    if key not in values:
+        values.append(key)
+    return tuple(values)
+
+
+def _remove_volatile_status(existing: Sequence[str], status: str) -> tuple[str, ...]:
+    key = _normalize_move_id(status)
+    return tuple(value for value in existing if value != key)
 
 
 def _opponent_slot(player_slot: str) -> str:
