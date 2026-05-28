@@ -260,11 +260,12 @@ def _forced_switch_plan(
             score = max(0.01, _condition_hp_fraction(pokemon.get("condition")) or 0.0) * 100.0
             reason = "forced switch"
         actions.append(_scored_action(choice, label, max(0.01, score), reason))
-    decision = _choose_weighted(actions, rng)
+    selection_pool = _selection_pool(actions)
+    decision = _choose_weighted(selection_pool, rng)
     return CustomBotPlan(
         decision=decision,
-        notes=_notes(decision, actions, fallback_reason=None),
-        actions=actions,
+        notes=_notes(decision, selection_pool, fallback_reason=None),
+        actions=selection_pool,
     )
 
 
@@ -649,6 +650,8 @@ def _voluntary_switch_scores(
 
     opponent_moves = _revealed_opponent_moves(context, public_lines)[:4]
     if not opponent_moves and best_existing >= 20.0:
+        return []
+    if _own_active_move_count_since_switch(context, public_lines, own_active.ident) < 2 and best_existing > 0:
         return []
     after_forced_switch = _active_entered_after_own_faint(context, public_lines, own_active.ident)
     scores: List[ScoredAction] = []
@@ -1164,6 +1167,38 @@ def _active_entered_after_own_faint(
                 active_switch_after_faint = False
             last_own_event = "move"
     return active_switch_after_faint
+
+
+def _own_active_move_count_since_switch(
+    context: Dict[str, Any],
+    public_lines: Sequence[str],
+    own_ident: Optional[str],
+) -> int:
+    if not own_ident:
+        return 999
+    player_slot = _effective_player_slot(context)
+    active_seen = False
+    move_count = 999
+    for line in public_lines:
+        parts = line.split("|") if isinstance(line, str) else []
+        if len(parts) < 3:
+            continue
+        event_type = parts[1]
+        actor = parts[2]
+        if not _ident_matches_slot(actor, player_slot):
+            continue
+        if event_type in {"switch", "drag", "replace"}:
+            active_seen = _same_ident(actor, own_ident)
+            move_count = 0 if active_seen else 999
+            continue
+        if not active_seen or not _same_ident(actor, own_ident):
+            continue
+        if event_type == "move":
+            move_count += 1
+        elif event_type == "faint":
+            active_seen = False
+            move_count = 999
+    return move_count
 
 
 def _heuristic_move_metadata(move_name: str, request_move: Dict[str, Any]) -> Dict[str, Any]:

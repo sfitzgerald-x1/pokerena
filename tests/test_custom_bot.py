@@ -558,6 +558,14 @@ class CustomBotTest(unittest.TestCase):
             bench=[
                 {"ident": "p1: Jolteon", "details": "Jolteon, L80", "condition": "100/100"},
             ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|turn|3",
+            ],
         )
         metadata = {"Tackle": _metadata("Tackle", base_power=40)}
         ranges = {"Tackle": (5, 7)}
@@ -610,6 +618,39 @@ class CustomBotTest(unittest.TestCase):
         )
         metadata = {"Blizzard": _metadata("Blizzard", base_power=120)}
         ranges = {"Blizzard": (30, 35), "surf": (90, 100)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertIn("move 1", {action.choice for action in plan.actions})
+        self.assertNotIn("switch 2", {action.choice for action in plan.actions})
+
+    def test_switches_are_suppressed_immediately_after_any_switch_in(self) -> None:
+        context = _context(
+            [{"move": "Slash", "id": "slash", "disabled": False}],
+            player_slot="p2",
+            side_id="p2",
+            own_species="Meowth",
+            opponent_species="Golem",
+            bench=[
+                {
+                    "ident": "p2: Shellder",
+                    "details": "Shellder, L90",
+                    "condition": "100/100",
+                    "moves": ["surf", "blizzard", "explosion", "doubleedge"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Golem|Golem, L71|100/100",
+                "|switch|p2a: Jolteon|Jolteon, L69|0 fnt",
+                "|faint|p2a: Jolteon",
+                "|switch|p2a: Meowth|Meowth, L85|100/100",
+                "|turn|2",
+            ],
+        )
+        metadata = {"Slash": _metadata("Slash", base_power=70, high_crit=True)}
+        ranges = {"Slash": (0, 0), "surf": (140, 160)}
 
         with _patched_calc(metadata, ranges):
             plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
@@ -680,11 +721,8 @@ class CustomBotTest(unittest.TestCase):
         with _patched_calc({}, ranges):
             plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(10))
 
-        self.assertIn(plan.decision, {"switch 2", "switch 3"})
-        self.assertGreater(
-            {action.choice: action for action in plan.actions}["switch 2"].score,
-            {action.choice: action for action in plan.actions}["switch 3"].score,
-        )
+        self.assertEqual(plan.decision, "switch 2")
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
 
     def test_choose_weighted_tracks_weight_distribution(self) -> None:
         actions = [
