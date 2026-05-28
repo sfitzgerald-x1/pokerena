@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import random
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 from pokerena.config import ConfigError
+from pokerena.custom_bot_claude import decide_custom_bot_claude_from_files
 from pokerena.custom_bot import (
     PokemonState,
     _base_speed_for_species,
@@ -1215,6 +1218,105 @@ class CustomBotTest(unittest.TestCase):
 
         self.assertIn("damage calc batch failed", plan.notes)
         self.assertIn("damage calc batch failed", plan.warnings[0])
+
+    def test_claude_override_can_replace_custom_bot_decision_with_legal_choice(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+            ]
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Body Slam": _metadata("Body Slam", base_power=85),
+        }
+        ranges = {"Tackle": (40, 40), "Body Slam": (20, 20)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "turn-context.json"
+            context_path.write_text(json.dumps(context), encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["claude"],
+                0,
+                stdout=(
+                    '{"schema_version":"pokerena.decision.v1",'
+                    '"decision":"move 2","notes":"Body Slam paralysis chance matters."}'
+                ),
+                stderr="",
+            )
+            with _patched_calc(metadata, ranges), mock.patch(
+                "pokerena.custom_bot_claude.subprocess.run",
+                return_value=completed,
+            ) as run:
+                decision = decide_custom_bot_claude_from_files(
+                    context_path=str(context_path),
+                    capture_path=None,
+                    seed="1",
+                    project_root=Path.cwd(),
+                    claude_command="claude",
+                    model="claude-opus-4-7",
+                    claude_timeout_seconds=5,
+                )
+
+        self.assertEqual(decision.decision, "move 2")
+        self.assertIn("claude override changed", decision.notes)
+        prompt = run.call_args.kwargs["input"]
+        self.assertIn("CUSTOM BOT BASELINE", prompt)
+        self.assertIn("claude-opus-4-7", run.call_args.args[0])
+
+    def test_claude_override_ignores_illegal_choice(self) -> None:
+        context = _context(
+            [{"move": "Tackle", "id": "tackle", "disabled": False}],
+        )
+        metadata = {"Tackle": _metadata("Tackle", base_power=40)}
+        ranges = {"Tackle": (40, 40)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "turn-context.json"
+            context_path.write_text(json.dumps(context), encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["claude"],
+                0,
+                stdout='{"schema_version":"pokerena.decision.v1","decision":"switch 9","notes":"bad"}',
+                stderr="",
+            )
+            with _patched_calc(metadata, ranges), mock.patch(
+                "pokerena.custom_bot_claude.subprocess.run",
+                return_value=completed,
+            ):
+                decision = decide_custom_bot_claude_from_files(
+                    context_path=str(context_path),
+                    capture_path=None,
+                    seed="1",
+                    project_root=Path.cwd(),
+                )
+
+        self.assertEqual(decision.decision, "move 1")
+        self.assertIn("ignored illegal decision", decision.notes)
+
+    def test_claude_override_falls_back_to_custom_bot_when_claude_fails(self) -> None:
+        context = _context(
+            [{"move": "Tackle", "id": "tackle", "disabled": False}],
+        )
+        metadata = {"Tackle": _metadata("Tackle", base_power=40)}
+        ranges = {"Tackle": (40, 40)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "turn-context.json"
+            context_path.write_text(json.dumps(context), encoding="utf-8")
+            with _patched_calc(metadata, ranges), mock.patch(
+                "pokerena.custom_bot_claude.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("claude", timeout=5),
+            ):
+                decision = decide_custom_bot_claude_from_files(
+                    context_path=str(context_path),
+                    capture_path=None,
+                    seed="1",
+                    project_root=Path.cwd(),
+                )
+
+        self.assertEqual(decision.decision, "move 1")
+        self.assertIn("claude override unavailable", decision.notes)
 
 
 def _context(

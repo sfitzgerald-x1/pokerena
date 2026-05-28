@@ -53,6 +53,12 @@ from .calc import (
 )
 from .config import ConfigError, load_agents_config, load_server_config
 from .custom_bot import decide_custom_bot_from_files, emit_custom_bot_decision
+from .custom_bot_claude import (
+    DEFAULT_CLAUDE_OVERRIDE_MODEL,
+    DEFAULT_CLAUDE_OVERRIDE_TIMEOUT_SECONDS,
+    decide_custom_bot_claude_from_files,
+    emit_custom_bot_claude_decision,
+)
 from .runtime_env import filtered_runtime_env
 from .showdown import build_server_command, node_version, prepare_runtime
 from .transcript import (
@@ -130,6 +136,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return run_agent_decide(args)
             if args.agent_command == "custom-bot":
                 return run_agent_custom_bot(args)
+            if args.agent_command == "custom-bot-claude":
+                return run_agent_custom_bot_claude(args)
             if args.agent_command == "sim-battle":
                 return run_agent_sim_battle(args)
             if args.agent_command == "showdown-client":
@@ -270,6 +278,48 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_CALC_TIMEOUT_SECONDS,
         help="How long to wait for local calc worker damage and move metadata requests.",
+    )
+
+    custom_bot_claude_parser = agent_subparsers.add_parser(
+        "custom-bot-claude",
+        help="Run the Gen 1 custom bot, then let Claude Code review and optionally override it.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--context",
+        default=None,
+        help="Path to turn-context JSON. Defaults to POKERENA_TURN_CONTEXT_PATH.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--capture",
+        default=None,
+        help="Optional path to battle-capture JSON. Defaults to POKERENA_BATTLE_CAPTURE_PATH.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--seed",
+        default=None,
+        help="Optional seed for deterministic custom-bot baseline decisions.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--calc-timeout",
+        type=int,
+        default=DEFAULT_CALC_TIMEOUT_SECONDS,
+        help="How long to wait for local calc worker damage and move metadata requests.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--claude-command",
+        default="claude",
+        help="Claude Code executable to invoke.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--model",
+        default=DEFAULT_CLAUDE_OVERRIDE_MODEL,
+        help="Claude model passed to Claude Code.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--claude-timeout",
+        type=int,
+        default=DEFAULT_CLAUDE_OVERRIDE_TIMEOUT_SECONDS,
+        help="How long to wait for Claude Code override review.",
     )
 
     sim_parser = agent_subparsers.add_parser(
@@ -678,6 +728,21 @@ def run_agent_custom_bot(args: argparse.Namespace) -> int:
         calc_timeout_seconds=args.calc_timeout,
     )
     emit_custom_bot_decision(decision)
+    return 0
+
+
+def run_agent_custom_bot_claude(args: argparse.Namespace) -> int:
+    decision = decide_custom_bot_claude_from_files(
+        context_path=args.context,
+        capture_path=args.capture,
+        seed=args.seed,
+        project_root=detect_project_root(),
+        calc_timeout_seconds=args.calc_timeout,
+        claude_command=args.claude_command,
+        model=args.model,
+        claude_timeout_seconds=args.claude_timeout,
+    )
+    emit_custom_bot_claude_decision(decision)
     return 0
 
 

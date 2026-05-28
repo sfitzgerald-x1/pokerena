@@ -104,12 +104,11 @@ def decide_custom_bot_from_files(
         raise ConfigError("Custom bot requires --context or POKERENA_TURN_CONTEXT_PATH.")
     context_payload = _read_json_object(resolved_context_path, "turn context")
 
-    resolved_capture_path = Path(
-        capture_path or os.environ.get("POKERENA_BATTLE_CAPTURE_PATH") or ""
-    )
+    capture_value = capture_path or os.environ.get("POKERENA_BATTLE_CAPTURE_PATH")
+    resolved_capture_path = Path(capture_value) if capture_value else None
     capture_payload = (
         _read_json_object(resolved_capture_path, "battle capture")
-        if str(resolved_capture_path) and resolved_capture_path.exists()
+        if resolved_capture_path is not None and resolved_capture_path.exists()
         else None
     )
     rng = random.Random(seed) if seed is not None else random.Random()
