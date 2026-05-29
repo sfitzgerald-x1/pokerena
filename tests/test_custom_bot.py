@@ -11,18 +11,26 @@ from unittest import mock
 from pokerena.config import ConfigError
 from pokerena.custom_bot_claude import decide_custom_bot_claude_from_files
 from pokerena.custom_bot import (
+    SELECTION_ARGMAX,
+    SELECTION_WEIGHTED_CUBE,
+    SELECTION_WEIGHTED_LINEAR,
+    SELECTION_WEIGHTED_SQUARE,
     PokemonState,
+    _actions_with_selection_strategy,
     _base_speed_for_species,
     _choose_weighted,
     _effective_player_slot,
     _pokemon_types,
     _revealed_opponent_moves,
     _scored_action,
+    _select_action,
     _selection_pool,
     _sleep_clause_active,
     _status_base_value,
+    _switch_boost_multiplier,
     build_custom_bot_plan,
 )
+from pokerena.max_damage_bot import build_max_damage_bot_plan, decide_max_damage_bot_from_files
 
 
 class CustomBotTest(unittest.TestCase):
@@ -46,6 +54,120 @@ class CustomBotTest(unittest.TestCase):
         self.assertLess(by_choice["move 1"].score, by_choice["move 2"].score)
         self.assertAlmostEqual(by_choice["move 2"].weight, by_choice["move 2"].score ** 2)
         self.assertIn("custom-bot gen1randombattle weighted scores", plan.notes)
+        self.assertIn("selection=weighted-square", plan.notes)
+
+    def test_selection_strategy_weights_are_score_transforms(self) -> None:
+        actions = [
+            _scored_action("move 1", "Weak", 2.0, "weak"),
+            _scored_action("move 2", "Strong", 4.0, "strong"),
+        ]
+
+        linear = _actions_with_selection_strategy(actions, SELECTION_WEIGHTED_LINEAR)
+        square = _actions_with_selection_strategy(actions, SELECTION_WEIGHTED_SQUARE)
+        cube = _actions_with_selection_strategy(actions, SELECTION_WEIGHTED_CUBE)
+
+        self.assertEqual([action.weight for action in linear], [2.0, 4.0])
+        self.assertEqual([action.weight for action in square], [4.0, 16.0])
+        self.assertEqual([action.weight for action in cube], [8.0, 64.0])
+
+    def test_argmax_selection_chooses_highest_score_and_randomizes_ties(self) -> None:
+        actions = [
+            _scored_action("move 1", "Weak", 5.0, "weak"),
+            _scored_action("move 2", "Strong A", 10.0, "strong"),
+            _scored_action("move 3", "Strong B", 10.0, "strong"),
+        ]
+        rng = random.Random(123)
+        choices = set()
+
+        for _ in range(20):
+            decision, weighted = _select_action(actions, rng, SELECTION_ARGMAX)
+            choices.add(decision)
+
+        self.assertEqual(choices, {"move 2", "move 3"})
+        self.assertEqual([action.weight for action in weighted], [0.0, 1.0, 1.0])
+
+    def test_cube_strategy_is_more_top_heavy_than_square_and_linear(self) -> None:
+        actions = [
+            _scored_action("move 1", "Weak", 1.0, "weak"),
+            _scored_action("move 2", "Strong", 3.0, "strong"),
+        ]
+
+        linear = _actions_with_selection_strategy(actions, SELECTION_WEIGHTED_LINEAR)
+        square = _actions_with_selection_strategy(actions, SELECTION_WEIGHTED_SQUARE)
+        cube = _actions_with_selection_strategy(actions, SELECTION_WEIGHTED_CUBE)
+
+        self.assertEqual(linear[1].weight / linear[0].weight, 3.0)
+        self.assertEqual(square[1].weight / square[0].weight, 9.0)
+        self.assertEqual(cube[1].weight / cube[0].weight, 27.0)
+
+    def test_counter_revealed_penalizes_normal_and_fighting_attacks(self) -> None:
+        common_events = [
+            "|gen|1",
+            "|switch|p1a: Tauros|Tauros, L80|100/100",
+            "|switch|p2a: Alakazam|Alakazam, L80|100/100",
+            "|move|p2a: Alakazam|Counter|p1a: Tauros",
+            "|turn|4",
+        ]
+        cases = [
+            ("Body Slam", "bodyslam", "Normal"),
+            ("Submission", "submission", "Fighting"),
+        ]
+
+        for move_name, move_id, move_type in cases:
+            with self.subTest(move=move_name):
+                no_counter_context = _context(
+                    [{"move": move_name, "id": move_id, "disabled": False}],
+                    own_species="Tauros",
+                    opponent_species="Alakazam",
+                )
+                counter_context = _context(
+                    [{"move": move_name, "id": move_id, "disabled": False}],
+                    own_species="Tauros",
+                    opponent_species="Alakazam",
+                    recent_public_events=common_events,
+                )
+                metadata = {move_name: _metadata(move_name, base_power=80, move_type=move_type)}
+                ranges = {move_name: (40, 40)}
+
+                with _patched_calc(metadata, ranges):
+                    no_counter = build_custom_bot_plan(
+                        no_counter_context,
+                        project_root=Path.cwd(),
+                        rng=random.Random(1),
+                    )
+                    counter = build_custom_bot_plan(
+                        counter_context,
+                        project_root=Path.cwd(),
+                        rng=random.Random(1),
+                    )
+
+                self.assertAlmostEqual(counter.actions[0].score, no_counter.actions[0].score * 0.25)
+                self.assertIn("Counter risk", counter.actions[0].reason)
+
+    def test_inaccurate_moves_are_heavily_penalized_when_accurate_move_reliably_kos(self) -> None:
+        context = _context(
+            [
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+                {"move": "Blizzard", "id": "blizzard", "disabled": False},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Tauros|Tauros, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|30/100",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Body Slam": _metadata("Body Slam", base_power=85, accuracy=100),
+            "Blizzard": _metadata("Blizzard", base_power=120, accuracy=90, move_type="Ice"),
+        }
+        ranges = {"Body Slam": (35, 40), "Blizzard": (90, 100)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(1))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+        self.assertEqual(plan.decision, "move 1")
 
     def test_selection_pool_prunes_dominated_low_score_moves(self) -> None:
         actions = [
@@ -185,6 +307,66 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual(plan.actions, [])
         self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
 
+    def test_rest_scores_zero_at_mid_hp_without_status(self) -> None:
+        context = _context(
+            [{"move": "Rest", "id": "rest", "disabled": False}],
+            active_condition="40/100",
+        )
+        metadata = {"Rest": _metadata("Rest", category="Status", base_power=0)}
+
+        with _patched_calc(metadata, {}):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(3))
+
+        self.assertEqual(plan.actions, [])
+        self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
+
+    def test_rest_scores_lower_than_recover_because_sleep_has_a_cost(self) -> None:
+        rest_context = _context(
+            [{"move": "Rest", "id": "rest", "disabled": False}],
+            active_condition="40/100 par",
+        )
+        recover_context = _context(
+            [{"move": "Recover", "id": "recover", "disabled": False}],
+            active_condition="40/100",
+        )
+        metadata = {
+            "Rest": _metadata("Rest", category="Status", base_power=0),
+            "Recover": _metadata("Recover", category="Status", base_power=0),
+        }
+
+        with _patched_calc(metadata, {}):
+            rest_plan = build_custom_bot_plan(rest_context, project_root=Path.cwd(), rng=random.Random(3))
+            recover_plan = build_custom_bot_plan(recover_context, project_root=Path.cwd(), rng=random.Random(3))
+
+        self.assertLess(rest_plan.actions[0].score, recover_plan.actions[0].score)
+        self.assertIn("sleep cost", rest_plan.actions[0].reason)
+
+    def test_rest_scores_as_status_curing_recovery_below_half(self) -> None:
+        context = _context(
+            [{"move": "Rest", "id": "rest", "disabled": False}],
+            active_condition="45/100 brn",
+        )
+        metadata = {"Rest": _metadata("Rest", category="Status", base_power=0)}
+
+        with _patched_calc(metadata, {}):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(3))
+
+        self.assertGreater(plan.actions[0].score, 0)
+        self.assertIn("status-curing", plan.actions[0].reason)
+
+    def test_rest_scores_as_emergency_recovery_below_quarter_hp(self) -> None:
+        context = _context(
+            [{"move": "Rest", "id": "rest", "disabled": False}],
+            active_condition="20/100",
+        )
+        metadata = {"Rest": _metadata("Rest", category="Status", base_power=0)}
+
+        with _patched_calc(metadata, {}):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(3))
+
+        self.assertGreater(plan.actions[0].score, 0)
+        self.assertIn("emergency recovery", plan.actions[0].reason)
+
     def test_rest_sleep_does_not_activate_sleep_clause(self) -> None:
         context = _context(
             [{"move": "Sleep Powder", "id": "sleeppowder", "disabled": False}],
@@ -299,6 +481,53 @@ class CustomBotTest(unittest.TestCase):
         self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
         self.assertIn("damage calc batch failed", plan.warnings[0])
         self.assertNotEqual(plan.decision, "move 1")
+
+    def test_zero_score_fallback_avoids_known_no_effect_moves(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+            ],
+            opponent_species="Marowak",
+        )
+        metadata = {
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+            "Body Slam": _metadata("Body Slam", base_power=85),
+        }
+
+        def fake_metadata(*, move_names, **kwargs):
+            return {
+                "schema_version": "pokerena.move-metadata-result.v1",
+                "generation": 1,
+                "moves": [metadata[name] for name in move_names],
+            }
+
+        def fake_zero_damage_batch(payload, **kwargs):
+            return {
+                "schema_version": "pokerena.damage-batch-result.v1",
+                "results": [
+                    {
+                        "status": "ok",
+                        "move_name": request["move"]["name"],
+                        "generation": 1,
+                        "result": {"range_percent": {"min": 0, "max": 0}},
+                    }
+                    for request in payload["requests"]
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            _write_pokedex_fixture(project_root)
+            with mock.patch.multiple(
+                "pokerena.custom_bot",
+                describe_move_metadata=mock.Mock(side_effect=fake_metadata),
+                run_damage_calc_batch=mock.Mock(side_effect=fake_zero_damage_batch),
+            ):
+                plan = build_custom_bot_plan(context, project_root=project_root, rng=random.Random(4))
+
+        self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
+        self.assertEqual(plan.decision, "move 2")
 
     def test_pokedex_type_lookup_parses_showdown_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -637,6 +866,25 @@ class CustomBotTest(unittest.TestCase):
         self.assertLess(by_choice["move 1"].score, 40)
         self.assertGreater(by_choice["move 2"].score, by_choice["move 1"].score)
 
+    def test_sky_attack_is_heavily_deprioritized(self) -> None:
+        context = _context(
+            [
+                {"move": "Sky Attack", "id": "skyattack", "disabled": False},
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+            ]
+        )
+        metadata = {
+            "Sky Attack": _metadata("Sky Attack", base_power=140, accuracy=90, charge=True, move_type="Flying"),
+            "Body Slam": _metadata("Body Slam", base_power=85),
+        }
+        ranges = {"Sky Attack": (80, 90), "Body Slam": (35, 40)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
+        self.assertEqual(plan.decision, "move 2")
+
     def test_amnesia_is_high_value_at_high_hp_and_low_value_at_low_hp(self) -> None:
         high_hp = _context(
             [{"move": "Amnesia", "id": "amnesia", "disabled": False}],
@@ -694,6 +942,65 @@ class CustomBotTest(unittest.TestCase):
 
         self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
 
+    def test_reliable_ko_blocks_first_time_setup_boost(self) -> None:
+        context = _context(
+            [
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+                {"move": "Swords Dance", "id": "swordsdance", "disabled": False},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|30/100",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Body Slam": _metadata("Body Slam", base_power=85),
+            "Swords Dance": _metadata(
+                "Swords Dance",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"atk": 2},
+            ),
+        }
+        ranges = {"Body Slam": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+
+    def test_revealed_ko_threat_blocks_setup_boost(self) -> None:
+        context = _context(
+            [{"move": "Swords Dance", "id": "swordsdance", "disabled": False}],
+            active_condition="50/100",
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|50/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|move|p2a: Starmie|Surf|p1a: Venusaur",
+                "|turn|4",
+            ],
+        )
+        metadata = {
+            "Swords Dance": _metadata(
+                "Swords Dance",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"atk": 2},
+            ),
+        }
+        ranges = {"Surf": (60, 65)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual(plan.actions, [])
+        self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
+
     def test_agility_scores_zero_when_already_faster(self) -> None:
         context = _context(
             [{"move": "Agility", "id": "agility", "disabled": False}],
@@ -712,6 +1019,32 @@ class CustomBotTest(unittest.TestCase):
         with _patched_calc(metadata, {}), mock.patch(
             "pokerena.custom_bot._estimated_gen1_speed",
             return_value=160,
+        ):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual(plan.actions, [])
+        self.assertEqual(plan.fallback_reason, "all heuristic scores were zero")
+
+    def test_agility_scores_zero_when_boost_would_not_outspeed(self) -> None:
+        context = _context(
+            [{"move": "Agility", "id": "agility", "disabled": False}],
+            own_species="Slowpoke",
+            opponent_species="Jolteon",
+            own_stats={"hp": 280, "atk": 180, "def": 180, "spa": 200, "spd": 200, "spe": 40},
+        )
+        metadata = {
+            "Agility": _metadata(
+                "Agility",
+                category="Status",
+                base_power=0,
+                accuracy=True,
+                boosts={"spe": 2},
+            )
+        }
+
+        with _patched_calc(metadata, {}), mock.patch(
+            "pokerena.custom_bot._effective_gen1_speed",
+            return_value=200,
         ):
             plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
 
@@ -944,7 +1277,183 @@ class CustomBotTest(unittest.TestCase):
             plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
 
         self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
-        self.assertEqual(plan.actions[0].reason, "sleep-clause pivot")
+        self.assertIn("slp pivot", plan.actions[0].reason)
+
+    def test_opponent_induced_sleep_prioritizes_switching_out(self) -> None:
+        context = _context(
+            [{"move": "Thunderbolt", "id": "thunderbolt", "disabled": False}],
+            own_species="Gengar",
+            opponent_species="Venusaur",
+            active_condition="100/100 slp",
+            bench=[
+                {
+                    "ident": "p1: Snorlax",
+                    "details": "Snorlax, L80",
+                    "condition": "100/100",
+                    "moves": ["bodyslam"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Gengar|Gengar, L80|100/100",
+                "|switch|p2a: Venusaur|Venusaur, L80|100/100",
+                "|move|p2a: Venusaur|Sleep Powder|p1a: Gengar",
+                "|-status|p1a: Gengar|slp|[from] move: Sleep Powder",
+                "|turn|4",
+            ],
+        )
+        metadata = {"Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric")}
+        ranges = {"Thunderbolt": (60, 70), "bodyslam": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertIn("slp pivot", plan.actions[0].reason)
+
+    def test_rest_sleep_does_not_create_switch_only_pool(self) -> None:
+        context = _context(
+            [{"move": "Thunderbolt", "id": "thunderbolt", "disabled": False}],
+            own_species="Vaporeon",
+            opponent_species="Starmie",
+            active_condition="100/100 slp",
+            bench=[
+                {
+                    "ident": "p1: Snorlax",
+                    "details": "Snorlax, L80",
+                    "condition": "100/100",
+                    "moves": ["bodyslam"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Vaporeon|Vaporeon, L80|40/100 par",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|move|p1a: Vaporeon|Rest|p1a: Vaporeon",
+                "|-status|p1a: Vaporeon|slp|[from] move: Rest",
+                "|-heal|p1a: Vaporeon|100/100 slp|[silent]",
+                "|turn|4",
+            ],
+        )
+        metadata = {"Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric")}
+        ranges = {"Thunderbolt": (60, 70), "bodyslam": (35, 45)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertIn("move 1", {action.choice for action in plan.actions})
+        self.assertNotEqual({action.choice for action in plan.actions}, {"switch 2"})
+
+    def test_frozen_active_prioritizes_switching_out(self) -> None:
+        context = _context(
+            [{"move": "Blizzard", "id": "blizzard", "disabled": False}],
+            own_species="Jigglypuff",
+            opponent_species="Krabby",
+            active_condition="100/100 frz",
+            bench=[
+                {
+                    "ident": "p1: Jolteon",
+                    "details": "Jolteon, L80",
+                    "condition": "100/100",
+                    "moves": ["thunderbolt"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Jigglypuff|Jigglypuff, L80|100/100 frz",
+                "|switch|p2a: Krabby|Krabby, L80|100/100",
+                "|turn|4",
+            ],
+        )
+        metadata = {"Blizzard": _metadata("Blizzard", base_power=120)}
+        ranges = {"Blizzard": (60, 70), "thunderbolt": (110, 120)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertIn("frz pivot", plan.actions[0].reason)
+
+    def test_no_effect_active_moves_switch_out_instead_of_fallback(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+                {"move": "Thunder Wave", "id": "thunderwave", "disabled": False},
+            ],
+            own_species="Voltorb",
+            opponent_species="Sandshrew",
+            bench=[
+                {
+                    "ident": "p1: Blastoise",
+                    "details": "Blastoise, L80",
+                    "condition": "100/100",
+                    "moves": ["surf"],
+                },
+            ],
+        )
+        metadata = {
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+            "Thunder Wave": _metadata(
+                "Thunder Wave",
+                category="Status",
+                base_power=0,
+                status="par",
+                move_type="Electric",
+            ),
+        }
+        ranges = {"Thunderbolt": (0, 0), "surf": (110, 120)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertEqual(plan.decision, "switch 2")
+
+    def test_no_effect_active_moves_use_least_bad_switch_when_normal_switch_scores_zero(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+                {"move": "Thunder Wave", "id": "thunderwave", "disabled": False},
+            ],
+            own_species="Voltorb",
+            opponent_species="Sandshrew",
+            bench=[
+                {
+                    "ident": "p1: Slowpoke",
+                    "details": "Slowpoke, L83",
+                    "condition": "100/100",
+                    "moves": ["surf"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Voltorb|Voltorb, L80|100/100",
+                "|switch|p2a: Sandshrew|Sandshrew, L80|100/100",
+                "|move|p2a: Sandshrew|Earthquake|p1a: Voltorb",
+                "|move|p1a: Voltorb|Thunderbolt|p2a: Sandshrew",
+                "|move|p1a: Voltorb|Thunderbolt|p2a: Sandshrew",
+                "|turn|3",
+            ],
+        )
+        metadata = {
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+            "Thunder Wave": _metadata(
+                "Thunder Wave",
+                category="Status",
+                base_power=0,
+                status="par",
+                move_type="Electric",
+            ),
+        }
+        ranges = {"Thunderbolt": (0, 0), "Earthquake": (110, 120), "surf": (60, 70)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertEqual(plan.decision, "switch 2")
+        self.assertEqual(plan.fallback_reason, "all active moves scored zero")
+        self.assertIn("emergency switch fallback", plan.actions[0].reason)
 
     def test_sleeping_switch_candidate_is_deprioritized(self) -> None:
         context = _context([])
@@ -983,6 +1492,178 @@ class CustomBotTest(unittest.TestCase):
             plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(10))
 
         self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+
+    def test_frozen_switch_candidate_is_excluded(self) -> None:
+        context = _context([])
+        context["request_kind"] = "switch"
+        context["request"] = {
+            "forceSwitch": [True],
+            "side": {
+                "pokemon": [
+                    {"ident": "p1: Venusaur", "details": "Venusaur, L80", "condition": "0 fnt", "active": True},
+                    {
+                        "ident": "p1: Vaporeon",
+                        "details": "Vaporeon, L74",
+                        "condition": "100/100",
+                        "moves": ["surf"],
+                    },
+                    {
+                        "ident": "p1: Tauros",
+                        "details": "Tauros, L80",
+                        "condition": "100/100 frz",
+                        "moves": ["hyperbeam"],
+                    },
+                ]
+            },
+        }
+        context["side"] = context["request"]["side"]
+        context["recent_public_events"] = [
+            "|gen|1",
+            "|switch|p1a: Venusaur|Venusaur, L80|0 fnt",
+            "|faint|p1a: Venusaur",
+            "|switch|p2a: Rhydon|Rhydon, L80|100/100",
+            "|turn|8",
+        ]
+        ranges = {"surf": (95, 110), "hyperbeam": (120, 130)}
+
+        with _patched_calc({}, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(10))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+
+    def test_forced_switch_fallback_still_avoids_sleeping_bench_if_mobile_exists(self) -> None:
+        context = _context([])
+        context["request_kind"] = "switch"
+        context["request"] = {
+            "forceSwitch": [True],
+            "side": {
+                "pokemon": [
+                    {"ident": "p1: Venusaur", "details": "Venusaur, L80", "condition": "0 fnt", "active": True},
+                    {
+                        "ident": "p1: Slowpoke",
+                        "details": "Slowpoke, L83",
+                        "condition": "100/100",
+                        "moves": ["surf"],
+                    },
+                    {
+                        "ident": "p1: Tauros",
+                        "details": "Tauros, L80",
+                        "condition": "100/100 slp",
+                        "moves": ["hyperbeam"],
+                    },
+                ]
+            },
+        }
+        context["side"] = context["request"]["side"]
+        context["recent_public_events"] = [
+            "|gen|1",
+            "|switch|p1a: Venusaur|Venusaur, L80|0 fnt",
+            "|faint|p1a: Venusaur",
+            "|switch|p2a: Starmie|Starmie, L80|100/100",
+            "|move|p2a: Starmie|Surf|p1a: Venusaur",
+            "|turn|8",
+        ]
+        ranges = {"Surf": (110, 120), "surf": (20, 25), "hyperbeam": (100, 110)}
+
+        with _patched_calc({}, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(10))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertEqual(plan.fallback_reason, "no viable switch targets")
+        self.assertIn("forced switch fallback", plan.actions[0].reason)
+
+    def test_slow_switch_candidate_koed_by_revealed_move_is_excluded(self) -> None:
+        context = _context(
+            [{"move": "Tackle", "id": "tackle", "disabled": False}],
+            own_species="Venusaur",
+            opponent_species="Starmie",
+            bench=[
+                {
+                    "ident": "p1: Rhydon",
+                    "details": "Rhydon, L80",
+                    "condition": "100/100",
+                    "moves": ["earthquake"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|move|p2a: Starmie|Surf|p1a: Venusaur",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|turn|3",
+            ],
+        )
+        metadata = {"Tackle": _metadata("Tackle", base_power=40)}
+        ranges = {"Tackle": (5, 7), "Surf": (120, 130), "earthquake": (80, 90)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertNotIn("switch 2", {action.choice for action in plan.actions})
+
+    def test_faster_bench_reliable_ko_switch_is_highest_priority(self) -> None:
+        context = _context(
+            [{"move": "Tackle", "id": "tackle", "disabled": False}],
+            own_species="Venusaur",
+            opponent_species="Starmie",
+            bench=[
+                {
+                    "ident": "p1: Jolteon",
+                    "details": "Jolteon, L80",
+                    "condition": "100/100",
+                    "moves": ["thunderbolt"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|turn|3",
+            ],
+        )
+        metadata = {"Tackle": _metadata("Tackle", base_power=40)}
+        ranges = {"Tackle": (5, 7), "thunderbolt": (110, 120)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertEqual(plan.decision, "switch 2")
+        self.assertIn("faster reliable KO pivot", plan.actions[0].reason)
+
+    def test_active_reliable_ko_takes_precedence_over_faster_bench_ko(self) -> None:
+        context = _context(
+            [{"move": "Body Slam", "id": "bodyslam", "disabled": False}],
+            own_species="Venusaur",
+            opponent_species="Starmie",
+            bench=[
+                {
+                    "ident": "p1: Jolteon",
+                    "details": "Jolteon, L80",
+                    "condition": "100/100",
+                    "moves": ["thunderbolt"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|30/100",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|move|p1a: Venusaur|Tackle|p2a: Starmie",
+                "|turn|3",
+            ],
+        )
+        metadata = {"Body Slam": _metadata("Body Slam", base_power=85)}
+        ranges = {"Body Slam": (35, 40), "thunderbolt": (110, 120)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
 
     def test_switches_are_suppressed_right_after_forced_switch_with_usable_move(self) -> None:
         context = _context(
@@ -1091,6 +1772,128 @@ class CustomBotTest(unittest.TestCase):
         self.assertIn("switch 2", {action.choice for action in unboosted_plan.actions})
         self.assertNotIn("switch 2", {action.choice for action in boosted_plan.actions})
 
+    def test_major_setup_locks_in_even_when_faster_bench_has_ko(self) -> None:
+        context = _context(
+            [{"move": "Psychic", "id": "psychic", "disabled": False}],
+            own_species="Slowbro",
+            opponent_species="Starmie",
+            bench=[
+                {
+                    "ident": "p1: Jolteon",
+                    "details": "Jolteon, L80",
+                    "condition": "100/100",
+                    "moves": ["thunderbolt"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Slowbro|Slowbro, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|move|p1a: Slowbro|Amnesia|p1a: Slowbro",
+                "|-boost|p1a: Slowbro|spa|2",
+                "|-boost|p1a: Slowbro|spd|2",
+                "|move|p1a: Slowbro|Psychic|p2a: Starmie",
+                "|move|p2a: Starmie|Surf|p1a: Slowbro",
+                "|move|p1a: Slowbro|Psychic|p2a: Starmie",
+                "|move|p2a: Starmie|Surf|p1a: Slowbro",
+                "|turn|4",
+            ],
+        )
+        metadata = {"Psychic": _metadata("Psychic", base_power=90)}
+        ranges = {"Psychic": (18, 22), "Surf": (30, 35), "thunderbolt": (110, 120)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertIn("move 1", {action.choice for action in plan.actions})
+        self.assertNotIn("switch 2", {action.choice for action in plan.actions})
+
+    def test_major_setup_allows_switch_when_revealed_move_can_ko(self) -> None:
+        context = _context(
+            [{"move": "Psychic", "id": "psychic", "disabled": False}],
+            own_species="Slowbro",
+            opponent_species="Starmie",
+            active_condition="40/100",
+            bench=[
+                {
+                    "ident": "p1: Jolteon",
+                    "details": "Jolteon, L80",
+                    "condition": "100/100",
+                    "moves": ["thunderbolt"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Slowbro|Slowbro, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|100/100",
+                "|move|p1a: Slowbro|Amnesia|p1a: Slowbro",
+                "|-boost|p1a: Slowbro|spa|2",
+                "|-boost|p1a: Slowbro|spd|2",
+                "|move|p1a: Slowbro|Psychic|p2a: Starmie",
+                "|move|p2a: Starmie|Surf|p1a: Slowbro",
+                "|move|p1a: Slowbro|Psychic|p2a: Starmie",
+                "|move|p2a: Starmie|Surf|p1a: Slowbro",
+                "|turn|4",
+            ],
+        )
+        metadata = {"Psychic": _metadata("Psychic", base_power=90)}
+        ranges = {"Psychic": (18, 22), "Surf": (45, 50), "thunderbolt": (110, 120)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertIn("faster reliable KO pivot", plan.actions[0].reason)
+
+    def test_major_setup_with_all_zero_actions_can_still_emergency_switch(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+                {"move": "Thunder Wave", "id": "thunderwave", "disabled": False},
+            ],
+            own_species="Voltorb",
+            opponent_species="Sandshrew",
+            bench=[
+                {
+                    "ident": "p1: Blastoise",
+                    "details": "Blastoise, L80",
+                    "condition": "100/100",
+                    "moves": ["surf"],
+                },
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Voltorb|Voltorb, L80|100/100",
+                "|switch|p2a: Sandshrew|Sandshrew, L80|100/100",
+                "|-boost|p1a: Voltorb|spe|2",
+                "|move|p1a: Voltorb|Thunderbolt|p2a: Sandshrew",
+                "|move|p1a: Voltorb|Thunderbolt|p2a: Sandshrew",
+                "|turn|3",
+            ],
+        )
+        metadata = {
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+            "Thunder Wave": _metadata(
+                "Thunder Wave",
+                category="Status",
+                base_power=0,
+                status="par",
+                move_type="Electric",
+            ),
+        }
+        ranges = {"Thunderbolt": (0, 0), "surf": (110, 120)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(7))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"switch 2"})
+        self.assertEqual(plan.decision, "switch 2")
+
+    def test_switch_penalty_scales_down_as_setup_accumulates(self) -> None:
+        self.assertEqual(_switch_boost_multiplier(0), 1.0)
+        self.assertLess(_switch_boost_multiplier(4), _switch_boost_multiplier(2))
+        self.assertLess(_switch_boost_multiplier(6), 0.20)
+
     def test_low_hp_active_can_still_be_sacrificed_without_clear_switch(self) -> None:
         context = _context(
             [{"move": "Tackle", "id": "tackle", "disabled": False}],
@@ -1193,6 +1996,25 @@ class CustomBotTest(unittest.TestCase):
         ]
 
         self.assertTrue(_sleep_clause_active(context, public_lines))
+
+    def test_sleep_clause_stays_active_until_sleep_cure_or_faint(self) -> None:
+        context = _context(
+            [{"move": "Sleep Powder", "id": "sleeppowder", "disabled": False}],
+        )
+        public_lines = [
+            "|gen|1",
+            "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+            "|switch|p2a: Tauros|Tauros, L80|100/100",
+            "|move|p1a: Venusaur|Sleep Powder|p2a: Tauros",
+            "|-status|p2a: Tauros|slp",
+            "|move|p1a: Venusaur|Stun Spore|p2a: Tauros",
+            "|-status|p2a: Tauros|par",
+            "|switch|p2a: Tauros|Tauros, L80|100/100 par",
+        ]
+
+        self.assertTrue(_sleep_clause_active(context, public_lines))
+        self.assertFalse(_sleep_clause_active(context, [*public_lines, "|-curestatus|p2a: Tauros|slp"]))
+        self.assertFalse(_sleep_clause_active(context, [*public_lines, "|faint|p2a: Tauros"]))
 
     def test_revealed_opponent_moves_extracts_unique_moves(self) -> None:
         context = _context(
@@ -1371,6 +2193,112 @@ class CustomBotTest(unittest.TestCase):
 
         self.assertEqual(decision.decision, "move 1")
         self.assertIn("claude override unavailable", decision.notes)
+
+
+class MaxDamageBotTest(unittest.TestCase):
+    def test_selects_highest_mean_damage_move_deterministically(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunderbolt", "id": "thunderbolt", "disabled": False},
+                {"move": "Hydro Pump", "id": "hydropump", "disabled": False},
+                {"move": "Recover", "id": "recover", "disabled": False},
+            ]
+        )
+        metadata = {
+            "Thunderbolt": _metadata("Thunderbolt", base_power=95, move_type="Electric"),
+            "Hydro Pump": _metadata("Hydro Pump", base_power=120, accuracy=80, move_type="Water"),
+            "Recover": _metadata("Recover", category="Status", base_power=0),
+        }
+        ranges = {"Thunderbolt": (35, 45), "Hydro Pump": (50, 70)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_max_damage_bot_plan(context, project_root=Path.cwd())
+
+        self.assertEqual(plan.decision, "move 2")
+        self.assertEqual([action.choice for action in plan.actions], ["move 2", "move 1"])
+        self.assertIn("max-damage-bot gen1randombattle", plan.notes)
+        self.assertNotIn("move 3", plan.notes)
+
+    def test_ties_break_by_lower_move_index(self) -> None:
+        context = _context(
+            [
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+                {"move": "Double-Edge", "id": "doubleedge", "disabled": False},
+            ]
+        )
+        metadata = {
+            "Body Slam": _metadata("Body Slam", base_power=85),
+            "Double-Edge": _metadata("Double-Edge", base_power=100),
+        }
+        ranges = {"Body Slam": (40, 60), "Double-Edge": (45, 55)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_max_damage_bot_plan(context, project_root=Path.cwd())
+
+        self.assertEqual(plan.decision, "move 1")
+
+    def test_falls_back_when_no_damaging_calc_result_is_available(self) -> None:
+        context = _context(
+            [
+                {"move": "Thunder Wave", "id": "thunderwave", "disabled": False},
+                {"move": "Recover", "id": "recover", "disabled": False},
+            ]
+        )
+        metadata = {
+            "Thunder Wave": _metadata("Thunder Wave", category="Status", base_power=0),
+            "Recover": _metadata("Recover", category="Status", base_power=0),
+        }
+
+        with _patched_calc(metadata, {}):
+            plan = build_max_damage_bot_plan(context, project_root=Path.cwd())
+
+        self.assertEqual(plan.decision, "move 1")
+        self.assertEqual(plan.fallback_reason, "no enabled damaging moves")
+
+    def test_estimates_damage_for_calc_skipped_damaging_moves(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Hyper Beam", "id": "hyperbeam", "disabled": False},
+            ]
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Hyper Beam": _metadata("Hyper Beam", base_power=150),
+        }
+
+        with _patched_calc(metadata, {}):
+            plan = build_max_damage_bot_plan(context, project_root=Path.cwd())
+
+        self.assertEqual(plan.decision, "move 2")
+        self.assertIsNone(plan.fallback_reason)
+        self.assertIn("estimated damage", plan.notes)
+
+    def test_file_entrypoint_emits_valid_decision(self) -> None:
+        context = _context(
+            [
+                {"move": "Tackle", "id": "tackle", "disabled": False},
+                {"move": "Hyper Beam", "id": "hyperbeam", "disabled": False},
+            ]
+        )
+        metadata = {
+            "Tackle": _metadata("Tackle", base_power=40),
+            "Hyper Beam": _metadata("Hyper Beam", base_power=150),
+        }
+        ranges = {"Tackle": (10, 15), "Hyper Beam": (80, 95)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "turn-context.json"
+            context_path.write_text(json.dumps(context), encoding="utf-8")
+            with _patched_calc(metadata, ranges):
+                decision = decide_max_damage_bot_from_files(
+                    context_path=str(context_path),
+                    capture_path=None,
+                    project_root=Path.cwd(),
+                )
+
+        self.assertEqual(decision.decision, "move 2")
+        self.assertIn("max-damage-bot gen1randombattle", decision.notes)
 
 
 def _context(

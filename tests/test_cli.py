@@ -149,12 +149,107 @@ class CLITest(unittest.TestCase):
                     "capture.json",
                     "--seed",
                     "7",
+                    "--selection-strategy",
+                    "weighted-cube",
                 ]
             )
 
         self.assertEqual(code, 0)
         self.assertIn('"decision":"move 1"', buffer.getvalue())
         self.assertEqual(decide.call_args.kwargs["seed"], "7")
+        self.assertEqual(decide.call_args.kwargs["selection_strategy"], "weighted-cube")
+
+    def test_agent_max_damage_bot_command_prints_decision_json(self) -> None:
+        decision = AgentDecision(
+            schema_version="pokerena.decision.v1",
+            decision="move 2",
+            notes="max damage",
+            raw_output="",
+        )
+        with (
+            mock.patch("pokerena.cli.detect_project_root", return_value=Path.cwd()),
+            mock.patch("pokerena.cli.decide_max_damage_bot_from_files", return_value=decision) as decide,
+            mock.patch("sys.stdout", new=StringIO()) as buffer,
+        ):
+            code = main(
+                [
+                    "agent",
+                    "max-damage-bot",
+                    "--context",
+                    "turn-context.json",
+                    "--capture",
+                    "capture.json",
+                    "--calc-timeout",
+                    "9",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn('"decision":"move 2"', buffer.getvalue())
+        self.assertEqual(decide.call_args.kwargs["calc_timeout_seconds"], 9)
+
+    def test_agent_random_bot_command_prints_decision_json(self) -> None:
+        decision = AgentDecision(
+            schema_version="pokerena.decision.v1",
+            decision="switch 2",
+            notes="random switch",
+            raw_output="",
+        )
+        with (
+            mock.patch("pokerena.cli.decide_random_bot_from_files", return_value=decision) as decide,
+            mock.patch("sys.stdout", new=StringIO()) as buffer,
+        ):
+            code = main(
+                [
+                    "agent",
+                    "random-bot",
+                    "--context",
+                    "turn-context.json",
+                    "--capture",
+                    "capture.json",
+                    "--seed",
+                    "11",
+                    "--switch-chance",
+                    "0.25",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn('"decision":"switch 2"', buffer.getvalue())
+        self.assertEqual(decide.call_args.kwargs["seed"], "11")
+        self.assertEqual(decide.call_args.kwargs["switch_chance"], 0.25)
+
+    def test_eval_pool_command_runs_round_robin(self) -> None:
+        state = {
+            "run_id": "pool-test",
+            "status": "complete",
+            "games_total": 3,
+            "games_completed": 3,
+            "game_results": [{"game": 1}],
+        }
+        with (
+            mock.patch("pokerena.cli.run_pool_eval", return_value=state) as run_pool,
+            mock.patch("sys.stdout", new=StringIO()) as buffer,
+        ):
+            code = main(
+                [
+                    "eval",
+                    "pool",
+                    "--games-per-pair",
+                    "3",
+                    "--bots",
+                    "custom-bot",
+                    "random-bot",
+                    "--run-id",
+                    "pool-test",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(run_pool.call_args.kwargs["games_per_pair"], 3)
+        self.assertEqual(run_pool.call_args.kwargs["bot_ids"], ["custom-bot", "random-bot"])
+        self.assertEqual(run_pool.call_args.kwargs["run_id"], "pool-test")
+        self.assertNotIn("game_results", buffer.getvalue())
 
     def test_server_up_starts_callable_agents_and_shuts_them_down(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
