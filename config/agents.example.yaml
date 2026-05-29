@@ -13,6 +13,9 @@ agents:
         - pokerena
         - agent
         - custom-bot
+        # Optional custom-bot variants:
+        # - --selection-strategy
+        # - weighted-cube
       cwd: .
     hook:
       type: subprocess_stdio
@@ -24,6 +27,95 @@ agents:
     callable:
       enabled: false
       username: Gen1CustomBot
+      accepted_formats:
+        - gen1randombattle
+      challenge_policy: accept-direct-challenges
+
+  - id: gen1-custom-bot-claude
+    enabled: false
+    provider: pokerena-custom-bot-claude
+    player_slot: p1
+    format_allowlist:
+      - gen1randombattle
+    transport: showdown-client
+    launch:
+      command: python3.14
+      args:
+        - -m
+        - pokerena
+        - agent
+        - custom-bot-claude
+        - --model
+        - claude-opus-4-7
+      cwd: .
+    hook:
+      type: subprocess_stdio
+      context_format: pokerena.turn-context.v1
+      decision_format: pokerena.decision.v1
+      prompt_style: showdown-turn-v1
+      history_turn_limit: 60
+      decision_timeout_seconds: 90
+    callable:
+      enabled: false
+      username: Gen1ClaudeBot
+      accepted_formats:
+        - gen1randombattle
+      challenge_policy: accept-direct-challenges
+
+  - id: gen1-max-damage-bot
+    enabled: false
+    provider: pokerena-max-damage-bot
+    player_slot: p1
+    format_allowlist:
+      - gen1randombattle
+    transport: showdown-client
+    launch:
+      command: python3.14
+      args:
+        - -m
+        - pokerena
+        - agent
+        - max-damage-bot
+      cwd: .
+    hook:
+      type: subprocess_stdio
+      context_format: pokerena.turn-context.v1
+      decision_format: pokerena.decision.v1
+      prompt_style: showdown-turn-v1
+      history_turn_limit: 60
+      decision_timeout_seconds: 30
+    callable:
+      enabled: false
+      username: Gen1MaxDamageBot
+      accepted_formats:
+        - gen1randombattle
+      challenge_policy: accept-direct-challenges
+
+  - id: gen1-random-bot
+    enabled: false
+    provider: pokerena-random-bot
+    player_slot: p1
+    format_allowlist:
+      - gen1randombattle
+    transport: showdown-client
+    launch:
+      command: python3.14
+      args:
+        - -m
+        - pokerena
+        - agent
+        - random-bot
+      cwd: .
+    hook:
+      type: subprocess_stdio
+      context_format: pokerena.turn-context.v1
+      decision_format: pokerena.decision.v1
+      prompt_style: showdown-turn-v1
+      history_turn_limit: 60
+      decision_timeout_seconds: 30
+    callable:
+      enabled: false
+      username: Gen1RandomBot
       accepted_formats:
         - gen1randombattle
       challenge_policy: accept-direct-challenges

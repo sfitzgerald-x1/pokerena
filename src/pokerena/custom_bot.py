@@ -8,7 +8,7 @@ long-term sacrifice planning.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import os
 from pathlib import Path
@@ -30,11 +30,29 @@ from .config import ConfigError
 
 
 CUSTOM_BOT_SUPPORTED_FORMAT = "gen1randombattle"
+SELECTION_WEIGHTED_SQUARE = "weighted-square"
+SELECTION_ARGMAX = "argmax"
+SELECTION_WEIGHTED_CUBE = "weighted-cube"
+SELECTION_WEIGHTED_LINEAR = "weighted-linear"
+DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY = SELECTION_WEIGHTED_SQUARE
+CUSTOM_BOT_SELECTION_STRATEGIES = (
+    SELECTION_WEIGHTED_SQUARE,
+    SELECTION_ARGMAX,
+    SELECTION_WEIGHTED_CUBE,
+    SELECTION_WEIGHTED_LINEAR,
+)
 MAJOR_STATUSES = {"slp", "par", "psn", "tox", "brn", "frz"}
 SLEEP_MOVES = {"hypnosis", "lovelykiss", "sing", "sleeppowder", "spore"}
 CHARGE_MOVE_IDS = {"solarbeam", "skyattack", "skullbash"}
+DEFAULT_CHARGE_MOVE_MULTIPLIER = 0.45
+CHARGE_MOVE_MULTIPLIERS = {"skyattack": 0.12}
+REDUNDANT_HYPER_BEAM_KO_MULTIPLIER = 0.35
 SELF_KO_MOVE_IDS = {"explosion", "selfdestruct"}
+RECOVERY_MOVE_IDS = {"recover", "softboiled"}
 BOOST_CAP = 6
+SLEEP_SOURCE_REST = "rest_sleep"
+SLEEP_SOURCE_OPPONENT = "opponent_sleep"
+SLEEP_SOURCE_UNKNOWN = "unknown_sleep"
 GEN1_TYPE_IMMUNITIES = {
     "Electric": {"Ground"},
     "Fighting": {"Ghost"},
@@ -89,6 +107,14 @@ class MoveCandidate:
     metadata: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SwitchCandidateEvaluation:
+    score: float
+    reason: str
+    faster: Optional[bool] = None
+    reliable_ko: bool = False
+
+
 def decide_custom_bot_from_files(
     *,
     context_path: Optional[str],
@@ -96,6 +122,7 @@ def decide_custom_bot_from_files(
     seed: Optional[str],
     project_root: Optional[Path] = None,
     calc_timeout_seconds: int = DEFAULT_CALC_TIMEOUT_SECONDS,
+    selection_strategy: str = DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
 ) -> AgentDecision:
     resolved_context_path = Path(
         context_path or os.environ.get("POKERENA_TURN_CONTEXT_PATH") or ""
@@ -104,12 +131,11 @@ def decide_custom_bot_from_files(
         raise ConfigError("Custom bot requires --context or POKERENA_TURN_CONTEXT_PATH.")
     context_payload = _read_json_object(resolved_context_path, "turn context")
 
-    resolved_capture_path = Path(
-        capture_path or os.environ.get("POKERENA_BATTLE_CAPTURE_PATH") or ""
-    )
+    capture_value = capture_path or os.environ.get("POKERENA_BATTLE_CAPTURE_PATH")
+    resolved_capture_path = Path(capture_value) if capture_value else None
     capture_payload = (
         _read_json_object(resolved_capture_path, "battle capture")
-        if str(resolved_capture_path) and resolved_capture_path.exists()
+        if resolved_capture_path is not None and resolved_capture_path.exists()
         else None
     )
     rng = random.Random(seed) if seed is not None else random.Random()
@@ -119,6 +145,7 @@ def decide_custom_bot_from_files(
         project_root=project_root,
         rng=rng,
         calc_timeout_seconds=calc_timeout_seconds,
+        selection_strategy=selection_strategy,
     )
     for warning in plan.warnings or []:
         print(warning, file=sys.stderr)
@@ -141,8 +168,10 @@ def build_custom_bot_plan(
     project_root: Optional[Path] = None,
     rng: Optional[random.Random] = None,
     calc_timeout_seconds: int = DEFAULT_CALC_TIMEOUT_SECONDS,
+    selection_strategy: str = DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
 ) -> CustomBotPlan:
     chooser = rng or random.Random()
+    strategy = _normalize_selection_strategy(selection_strategy)
     request = context.get("request") if isinstance(context.get("request"), dict) else None
     if not request:
         return _fallback_plan(request, "no active request", chooser)
@@ -160,6 +189,7 @@ def build_custom_bot_plan(
             public_lines=public_lines,
             project_root=root,
             calc_timeout_seconds=calc_timeout_seconds,
+            selection_strategy=strategy,
         )
 
     if request_kind != "move" or not _is_supported_gen1_randbat(context):
@@ -197,8 +227,24 @@ def build_custom_bot_plan(
     ] if damage_results.warning else []
     sleep_clause_active = _sleep_clause_active(context, public_lines)
     own_boosts = _boosts_for_active(context, public_lines, own_active.ident)
+    active_sleep_source = _active_sleep_source(context, public_lines, own_active)
+    reliable_ko_choices = _reliable_ko_choices(damage_results.results, opponent)
+    accurate_reliable_ko_choices = _accurate_reliable_ko_choices(
+        candidates=move_candidates,
+        damage_results=damage_results.results,
+        opponent=opponent,
+    )
     has_ko_line = _has_ko_line(damage_results.results.values(), opponent)
     mon_count_advantage = _remaining_pokemon_advantage(context, public_lines)
+    opponent_moves = _revealed_opponent_moves(context, public_lines)[:4]
+    counter_revealed = _counter_revealed(opponent_moves)
+    incoming_threat_pct = _worst_incoming_damage_pct(
+        opponent=opponent,
+        defender=own_active,
+        move_names=opponent_moves,
+        project_root=root,
+        calc_timeout_seconds=calc_timeout_seconds,
+    )
     action_scores: List[ScoredAction] = []
     best_damage_score = 0.0
     for candidate in move_candidates:
@@ -210,17 +256,18 @@ def build_custom_bot_plan(
                 own_active=own_active,
                 opponent=opponent,
                 mon_count_advantage=mon_count_advantage,
+                counter_revealed=counter_revealed,
+                project_root=root,
             )
             score = _add_secondary_status_value(score, candidate, opponent)
-            best_damage_score = max(best_damage_score, score)
         elif _is_damaging_metadata(candidate.metadata):
             score, reason = _score_uncalculated_damaging_move(
                 candidate,
                 own_active=own_active,
                 opponent=opponent,
                 project_root=root,
+                counter_revealed=counter_revealed,
             )
-            best_damage_score = max(best_damage_score, score)
         else:
             score, reason = _score_status_or_utility_move(
                 candidate,
@@ -229,13 +276,56 @@ def build_custom_bot_plan(
                 own_boosts=own_boosts,
                 sleep_clause_active=sleep_clause_active,
                 has_ko_line=has_ko_line,
+                has_reliable_ko_line=bool(reliable_ko_choices),
+                incoming_threat_pct=incoming_threat_pct,
                 project_root=root,
             )
+        if (
+            score > 0
+            and accurate_reliable_ko_choices
+            and candidate.choice not in accurate_reliable_ko_choices
+            and _is_damaging_metadata(candidate.metadata)
+            and _accuracy_factor(candidate.metadata) < 1.0
+        ):
+            score *= 0.10
+            reason = f"{reason}; inaccurate move heavily deprioritized: 100% accurate KO available"
+        if (
+            score > 0
+            and _metadata_id(candidate.metadata) == "hyperbeam"
+            and candidate.choice in reliable_ko_choices
+            and _has_equal_or_more_accurate_non_hyper_beam_reliable_ko(
+                candidate,
+                candidates=move_candidates,
+                reliable_ko_choices=reliable_ko_choices,
+            )
+        ):
+            score *= REDUNDANT_HYPER_BEAM_KO_MULTIPLIER
+            reason = f"{reason}; safer non-Hyper Beam KO available"
         if score > 0 and own_active.status == "slp":
             score *= 0.20
             reason = f"{reason}; active asleep"
+        if _is_damaging_metadata(candidate.metadata):
+            best_damage_score = max(best_damage_score, score)
         if score > 0:
             action_scores.append(_scored_action(candidate.choice, candidate.name, score, reason))
+
+    active_has_reliable_ko = False
+    if reliable_ko_choices:
+        reliable_ko_scores = [
+            action for action in action_scores if action.choice in reliable_ko_choices and action.score >= 20.0
+        ]
+        if reliable_ko_scores:
+            action_scores = reliable_ko_scores
+            active_has_reliable_ko = own_active.status not in {"slp", "frz"}
+
+    force_sleep_switch = own_active.status == "slp" and active_sleep_source != SLEEP_SOURCE_REST
+    force_switch_only = own_active.status == "frz" or force_sleep_switch or not action_scores
+    major_setup_locked = _major_setup_lock_in_active(
+        own_active=own_active,
+        own_boosts=own_boosts,
+        action_scores=action_scores,
+        incoming_threat_pct=incoming_threat_pct,
+    )
 
     switch_scores = _voluntary_switch_scores(
         context=context,
@@ -246,21 +336,72 @@ def build_custom_bot_plan(
         existing_scores=action_scores,
         best_damage_score=best_damage_score,
         own_boosts=own_boosts,
+        active_has_reliable_ko=active_has_reliable_ko,
+        force_switch_only=force_switch_only,
+        active_sleep_source=active_sleep_source,
+        major_setup_locked=major_setup_locked,
         project_root=root,
         calc_timeout_seconds=calc_timeout_seconds,
     )
+    if force_switch_only and switch_scores:
+        decision, selection_pool = _select_action(_selection_pool(switch_scores), chooser, strategy)
+        notes = _notes(
+            decision,
+            selection_pool,
+            fallback_reason=None,
+            warnings=damage_warnings,
+            selection_strategy=strategy,
+        )
+        return CustomBotPlan(decision=decision, notes=notes, actions=selection_pool, warnings=damage_warnings)
+    if force_switch_only and not switch_scores:
+        emergency_switches = _least_bad_switch_scores(
+            request=request,
+            opponent=opponent,
+            opponent_moves=opponent_moves,
+            project_root=root,
+            calc_timeout_seconds=calc_timeout_seconds,
+            reason_prefix="emergency switch fallback",
+        )
+        if emergency_switches:
+            decision, selection_pool = _select_action(_selection_pool(emergency_switches), chooser, strategy)
+            notes = _notes(
+                decision,
+                selection_pool,
+                fallback_reason="all active moves scored zero",
+                warnings=damage_warnings,
+                selection_strategy=strategy,
+            )
+            return CustomBotPlan(
+                decision=decision,
+                notes=notes,
+                actions=selection_pool,
+                fallback_reason="all active moves scored zero",
+                warnings=damage_warnings,
+            )
     action_scores.extend(switch_scores)
     if not action_scores:
+        safe_fallback = _safe_zero_score_fallback_choice(
+            candidates=move_candidates,
+            opponent=opponent,
+            sleep_clause_active=sleep_clause_active,
+            project_root=root,
+        )
         return _fallback_plan(
             request,
             "all heuristic scores were zero",
             chooser,
             warnings=damage_warnings,
+            preferred_decision=safe_fallback,
         )
 
-    selection_pool = _selection_pool(action_scores)
-    decision = _choose_weighted(selection_pool, chooser)
-    notes = _notes(decision, selection_pool, fallback_reason=None, warnings=damage_warnings)
+    decision, selection_pool = _select_action(_selection_pool(action_scores), chooser, strategy)
+    notes = _notes(
+        decision,
+        selection_pool,
+        fallback_reason=None,
+        warnings=damage_warnings,
+        selection_strategy=strategy,
+    )
     return CustomBotPlan(decision=decision, notes=notes, actions=selection_pool, warnings=damage_warnings)
 
 
@@ -273,7 +414,9 @@ def _forced_switch_plan(
     public_lines: Sequence[str] = (),
     project_root: Optional[Path] = None,
     calc_timeout_seconds: int = DEFAULT_CALC_TIMEOUT_SECONDS,
+    selection_strategy: str = DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
 ) -> CustomBotPlan:
+    strategy = _normalize_selection_strategy(selection_strategy)
     switches = _available_switches(request)
     if not switches:
         return _fallback_plan(request, "no legal switch targets", rng)
@@ -281,23 +424,52 @@ def _forced_switch_plan(
     actions: List[ScoredAction] = []
     for choice, label, pokemon in switches:
         if opponent is not None and project_root is not None:
-            score = _switch_candidate_score(
+            evaluation = _switch_candidate_evaluation(
                 pokemon=pokemon,
                 opponent=opponent,
                 opponent_moves=opponent_moves,
                 project_root=project_root,
                 calc_timeout_seconds=calc_timeout_seconds,
             )
-            reason = "forced switch matchup"
+            if evaluation is None:
+                continue
+            score = evaluation.score
+            reason = f"forced switch matchup; {evaluation.reason}"
         else:
             score = max(0.01, _condition_hp_fraction(pokemon.get("condition")) or 0.0) * 100.0
             reason = "forced switch"
         actions.append(_scored_action(choice, label, max(0.01, score), reason))
-    selection_pool = _selection_pool(actions)
-    decision = _choose_weighted(selection_pool, rng)
+    if not actions:
+        fallback_actions = (
+            _least_bad_switch_scores(
+                request=request,
+                opponent=opponent,
+                opponent_moves=opponent_moves,
+                project_root=project_root,
+                calc_timeout_seconds=calc_timeout_seconds,
+                reason_prefix="forced switch fallback",
+            )
+            if opponent is not None and project_root is not None
+            else []
+        )
+        if fallback_actions:
+            decision, selection_pool = _select_action(_selection_pool(fallback_actions), rng, strategy)
+            return CustomBotPlan(
+                decision=decision,
+                notes=_notes(
+                    decision,
+                    selection_pool,
+                    fallback_reason="no viable switch targets",
+                    selection_strategy=strategy,
+                ),
+                actions=selection_pool,
+                fallback_reason="no viable switch targets",
+            )
+        return _fallback_plan(request, "no viable switch targets", rng)
+    decision, selection_pool = _select_action(_selection_pool(actions), rng, strategy)
     return CustomBotPlan(
         decision=decision,
-        notes=_notes(decision, selection_pool, fallback_reason=None),
+        notes=_notes(decision, selection_pool, fallback_reason=None, selection_strategy=strategy),
         actions=selection_pool,
     )
 
@@ -308,8 +480,9 @@ def _fallback_plan(
     rng: random.Random,
     *,
     warnings: Optional[List[str]] = None,
+    preferred_decision: Optional[str] = None,
 ) -> CustomBotPlan:
-    decision = choose_random_legal(request, rng=rng) if request is not None else choose_first_legal(request)
+    decision = preferred_decision or (choose_random_legal(request, rng=rng) if request is not None else choose_first_legal(request))
     warning_prefix = " ".join(warnings or [])
     notes = f"{warning_prefix} custom-bot fallback: {reason}; selected {decision}.".strip()
     return CustomBotPlan(
@@ -457,7 +630,11 @@ def _score_damaging_move(
     own_active: PokemonState,
     opponent: PokemonState,
     mon_count_advantage: int,
+    counter_revealed: bool,
+    project_root: Path,
 ) -> tuple[float, str]:
+    if _move_has_no_effect(candidate, opponent, project_root):
+        return 0.0, "damage move has no effect into target type"
     range_percent = damage_result.get("range_percent") if isinstance(damage_result, dict) else None
     if not isinstance(range_percent, dict):
         return 0.0, "missing damage range"
@@ -482,9 +659,19 @@ def _score_damaging_move(
             target_hp_pct=target_hp_pct,
         )
         score *= hyper_beam_multiplier
-    if bool(candidate.metadata.get("charge")) or move_id in CHARGE_MOVE_IDS:
-        score *= 0.45
+    charge_multiplier = _charge_move_multiplier(move_id, candidate.metadata)
+    if charge_multiplier < 1.0:
+        score *= charge_multiplier
     reason = f"damage {min_pct:.1f}-{max_pct:.1f}%"
+    if charge_multiplier < 1.0:
+        reason = (
+            f"{reason}; Sky Attack heavily deprioritized"
+            if move_id == "skyattack"
+            else f"{reason}; charge turn penalty"
+        )
+    if counter_revealed and _move_type(candidate.metadata) in {"Normal", "Fighting"}:
+        score *= 0.25
+        reason = f"{reason}; Counter risk"
     if move_id in SELF_KO_MOVE_IDS:
         multiplier, self_ko_reason = _self_ko_move_multiplier(
             own_active=own_active,
@@ -509,12 +696,15 @@ def _self_ko_move_multiplier(
     own_hp_fraction = own_active.hp_fraction if own_active.hp_fraction is not None else 1.0
     if own_hp_fraction <= 0.30:
         return 1.0, "self-KO allowed: user low HP"
-    sees_ko = max_pct >= target_hp_pct
-    if sees_ko and mon_count_advantage > 0:
+    reliable_ko = min_pct >= target_hp_pct
+    possible_ko = max_pct >= target_hp_pct
+    if reliable_ko and mon_count_advantage > 0:
         return 1.0, "self-KO allowed: KO while ahead in mons"
-    if sees_ko:
-        return 0.15, "self-KO deprioritized: KO trade not ahead in mons"
-    return 0.12, "self-KO deprioritized: no KO from healthy user"
+    if reliable_ko:
+        return 0.05, "self-KO heavily deprioritized: KO trade not ahead in mons"
+    if possible_ko:
+        return 0.03, "self-KO heavily deprioritized: uncertain KO from healthy user"
+    return 0.0, "self-KO blocked: no KO from healthy user"
 
 
 def _score_uncalculated_damaging_move(
@@ -523,6 +713,7 @@ def _score_uncalculated_damaging_move(
     own_active: PokemonState,
     opponent: PokemonState,
     project_root: Path,
+    counter_revealed: bool,
 ) -> tuple[float, str]:
     if _move_has_no_effect(candidate, opponent, project_root):
         return 0.0, "damage move has no effect into target type"
@@ -534,11 +725,22 @@ def _score_uncalculated_damaging_move(
     if move_type and move_type in _pokemon_types(own_active, project_root):
         score *= 1.5
     reason = "estimated damage: calc unavailable"
-    if _metadata_id(candidate.metadata) in SELF_KO_MOVE_IDS:
+    move_id = _metadata_id(candidate.metadata)
+    charge_multiplier = _charge_move_multiplier(move_id, candidate.metadata)
+    if charge_multiplier < 1.0:
+        score *= charge_multiplier
+        reason = (
+            f"{reason}; Sky Attack heavily deprioritized"
+            if move_id == "skyattack"
+            else f"{reason}; charge turn penalty"
+        )
+    if counter_revealed and move_type in {"Normal", "Fighting"}:
+        score *= 0.25
+        reason = f"{reason}; Counter risk"
+    if move_id in SELF_KO_MOVE_IDS:
         own_hp_fraction = own_active.hp_fraction if own_active.hp_fraction is not None else 1.0
         if own_hp_fraction > 0.30:
-            score *= 0.12
-            reason = "estimated damage: self-KO deprioritized while calc unavailable"
+            return 0.0, "estimated damage: self-KO blocked while calc unavailable"
         else:
             reason = "estimated damage: self-KO allowed at low HP"
     return max(1.0, min(score, 35.0)), reason
@@ -559,6 +761,84 @@ def _has_ko_line(
     return False
 
 
+def _safe_zero_score_fallback_choice(
+    *,
+    candidates: Sequence[MoveCandidate],
+    opponent: PokemonState,
+    sleep_clause_active: bool,
+    project_root: Path,
+) -> Optional[str]:
+    for candidate in candidates:
+        move_id = _metadata_id(candidate.metadata)
+        if move_id in SELF_KO_MOVE_IDS:
+            continue
+        if _is_damaging_metadata(candidate.metadata):
+            if _move_has_no_effect(candidate, opponent, project_root):
+                continue
+            return candidate.choice
+        status = str(candidate.metadata.get("status") or "")
+        if status in MAJOR_STATUSES:
+            if opponent.status in MAJOR_STATUSES:
+                continue
+            if status == "slp" and sleep_clause_active:
+                continue
+            if _status_move_is_ineffective(candidate, opponent, project_root):
+                continue
+            return candidate.choice
+        volatile_status = str(candidate.metadata.get("volatile_status") or "")
+        if volatile_status == "confusion" and _has_volatile_status(opponent, "confusion"):
+            continue
+        return candidate.choice
+    return None
+
+
+def _reliable_ko_choices(
+    damage_results: Dict[str, Dict[str, Any]],
+    opponent: PokemonState,
+) -> set[str]:
+    target_hp_pct = 100.0 * (opponent.hp_fraction if opponent.hp_fraction is not None else 1.0)
+    choices: set[str] = set()
+    for choice, damage_result in damage_results.items():
+        range_percent = damage_result.get("range_percent") if isinstance(damage_result, dict) else None
+        if not isinstance(range_percent, dict):
+            continue
+        min_pct = _float_value(range_percent.get("min")) or 0.0
+        if min_pct >= target_hp_pct:
+            choices.add(choice)
+    return choices
+
+
+def _accurate_reliable_ko_choices(
+    *,
+    candidates: Sequence[MoveCandidate],
+    damage_results: Dict[str, Dict[str, Any]],
+    opponent: PokemonState,
+) -> set[str]:
+    reliable_choices = _reliable_ko_choices(damage_results, opponent)
+    return {
+        candidate.choice
+        for candidate in candidates
+        if candidate.choice in reliable_choices and _accuracy_factor(candidate.metadata) >= 1.0
+    }
+
+
+def _has_equal_or_more_accurate_non_hyper_beam_reliable_ko(
+    candidate: MoveCandidate,
+    *,
+    candidates: Sequence[MoveCandidate],
+    reliable_ko_choices: set[str],
+) -> bool:
+    candidate_accuracy = _accuracy_factor(candidate.metadata)
+    for other in candidates:
+        if other.choice == candidate.choice or other.choice not in reliable_ko_choices:
+            continue
+        if _metadata_id(other.metadata) == "hyperbeam":
+            continue
+        if _accuracy_factor(other.metadata) >= candidate_accuracy:
+            return True
+    return False
+
+
 def _hyper_beam_recharge_risk_multiplier(
     *,
     min_pct: float,
@@ -568,12 +848,18 @@ def _hyper_beam_recharge_risk_multiplier(
     if min_pct >= target_hp_pct:
         return 1.0
     if max_pct <= target_hp_pct:
-        return 0.35
+        return 0.10
     roll_span = max_pct - min_pct
     if roll_span <= 0:
-        return 0.35
-    non_ko_fraction = max(0.0, min(1.0, (target_hp_pct - min_pct) / roll_span))
-    return 1.0 - (non_ko_fraction * 0.65)
+        return 0.10
+    ko_fraction = max(0.0, min(1.0, (max_pct - target_hp_pct) / roll_span))
+    return 0.20 + (ko_fraction * 0.80)
+
+
+def _charge_move_multiplier(move_id: str, metadata: Dict[str, Any]) -> float:
+    if not (bool(metadata.get("charge")) or move_id in CHARGE_MOVE_IDS):
+        return 1.0
+    return CHARGE_MOVE_MULTIPLIERS.get(move_id, DEFAULT_CHARGE_MOVE_MULTIPLIER)
 
 
 def _add_secondary_status_value(
@@ -603,11 +889,15 @@ def _score_status_or_utility_move(
     own_boosts: Dict[str, int],
     sleep_clause_active: bool,
     has_ko_line: bool,
+    has_reliable_ko_line: bool,
+    incoming_threat_pct: Optional[float],
     project_root: Path,
 ) -> tuple[float, str]:
     metadata = candidate.metadata
     status = str(metadata.get("status") or "")
     if status in MAJOR_STATUSES:
+        if has_reliable_ko_line:
+            return 0.0, f"inflict {status} blocked: reliable KO available"
         if opponent.status in MAJOR_STATUSES:
             return 0.0, f"target already statused with {opponent.status}"
         if status == "slp" and sleep_clause_active:
@@ -616,7 +906,7 @@ def _score_status_or_utility_move(
             return 0.0, "status move is ineffective into target type"
         score = _status_base_value(status, sleep_clause_active) * _accuracy_factor(metadata)
         if has_ko_line:
-            return score * 0.15, f"inflict {status} deprioritized: KO available"
+            return score * 0.05, f"inflict {status} heavily deprioritized: possible KO available"
         return score, f"inflict {status}"
 
     move_id = _metadata_id(metadata)
@@ -635,31 +925,63 @@ def _score_status_or_utility_move(
                 hp_fraction=hp_fraction,
                 project_root=project_root,
             )
-            if score > 0 and has_ko_line and _has_positive_boost(own_boosts):
-                return score * 0.15, f"{reason}; setup boost deprioritized: KO available"
+            score, reason = _adjust_setup_score(
+                score,
+                reason,
+                own_active=own_active,
+                has_reliable_ko_line=has_reliable_ko_line,
+                has_ko_line=has_ko_line,
+                incoming_threat_pct=incoming_threat_pct,
+            )
             return score, reason
         score = _boost_score(move_id, boosts, hp_fraction, own_boosts)
-        if score > 0 and has_ko_line and _has_positive_boost(own_boosts):
-            return score * 0.15, "setup boost deprioritized: KO available"
-        return score, "setup boost"
+        score, reason = _adjust_setup_score(
+            score,
+            "setup boost",
+            own_active=own_active,
+            has_reliable_ko_line=has_reliable_ko_line,
+            has_ko_line=has_ko_line,
+            incoming_threat_pct=incoming_threat_pct,
+        )
+        return score, reason
 
     volatile_status = str(metadata.get("volatile_status") or "")
     if volatile_status == "leechseed" and opponent.status not in MAJOR_STATUSES:
+        if has_reliable_ko_line:
+            return 0.0, "Leech Seed pressure blocked: reliable KO available"
         score = 40.0 * _accuracy_factor(metadata)
         if has_ko_line:
-            return score * 0.15, "Leech Seed pressure deprioritized: KO available"
+            return score * 0.05, "Leech Seed pressure heavily deprioritized: possible KO available"
         return score, "Leech Seed pressure"
     if volatile_status == "confusion":
+        if has_reliable_ko_line:
+            return 0.0, "confusion pressure blocked: reliable KO available"
         if _has_volatile_status(opponent, "confusion"):
             return 0.0, "target already confused"
         score = 35.0 * _accuracy_factor(metadata)
         if has_ko_line:
-            return score * 0.15, "confusion pressure deprioritized: KO available"
+            return score * 0.05, "confusion pressure heavily deprioritized: possible KO available"
         return score, "confusion pressure"
     if volatile_status in {"reflect", "lightscreen"}:
+        if _has_volatile_status(own_active, volatile_status):
+            return 0.0, f"{volatile_status} already active"
+        if has_reliable_ko_line:
+            return 0.0, f"{volatile_status} blocked: reliable KO available"
         return (35.0 * hp_fraction) if hp_fraction >= 0.35 else 5.0, volatile_status
+    if move_id in RECOVERY_MOVE_IDS:
+        if hp_fraction <= 0.65:
+            return max(8.0, 85.0 * (1.0 - hp_fraction)), "recovery"
+        if hp_fraction <= 0.80:
+            return 12.0 * (1.0 - hp_fraction), "recovery"
+        return 2.0, "recovery"
     if move_id == "rest":
-        return max(0.0, 70.0 * (1.0 - hp_fraction)) if hp_fraction <= 0.55 else 3.0, "recovery"
+        if own_active.status in {"par", "psn", "tox", "brn"} and hp_fraction < 0.50:
+            return max(18.0, 42.0 * (1.0 - hp_fraction)), "Rest status-curing recovery with sleep cost"
+        if own_active.status in {"slp", "frz"}:
+            return 0.0, f"Rest blocked: already {own_active.status}"
+        if hp_fraction < 0.25:
+            return max(10.0, 30.0 * (1.0 - hp_fraction)), "Rest emergency recovery with sleep cost"
+        return 0.0, "Rest too costly at current HP"
     return 5.0 * _accuracy_factor(metadata), "generic utility"
 
 
@@ -740,13 +1062,24 @@ def _agility_score(
 ) -> tuple[float, str]:
     if own_boosts.get("spe", 0) > 0:
         return 0.0, "Agility already boosted Speed"
+    own_speed = _known_speed_stat(own_active) or _estimated_gen1_speed(own_active, project_root)
+    opponent_speed = _effective_gen1_speed(opponent, project_root)
+    if own_speed is not None and opponent_speed is not None:
+        current_speed = _effective_speed_value(
+            own_speed,
+            status=own_active.status,
+            speed_boost=own_boosts.get("spe", 0),
+        )
+        post_agility_speed = _effective_speed_value(own_speed, status=None, speed_boost=2)
+        if current_speed is not None and current_speed >= opponent_speed:
+            return 0.0, "already likely faster"
+        if post_agility_speed <= opponent_speed:
+            return 0.0, "Agility would not outspeed opponent"
     if own_active.status == "par":
         if hp_fraction >= 0.35:
             return 92.0 * max(hp_fraction, 0.55), "Agility offsets Gen 1 paralysis Speed loss"
         return 30.0 * hp_fraction, "Agility offsets paralysis but user is low HP"
 
-    own_speed = _known_speed_stat(own_active)
-    opponent_speed = _estimated_gen1_speed(opponent, project_root)
     if own_speed is None or opponent_speed is None:
         if hp_fraction >= 0.70:
             return 22.0 * hp_fraction, "Agility with unknown Speed matchup"
@@ -761,6 +1094,34 @@ def _agility_score(
     if hp_fraction >= 0.45:
         return 38.0 * hp_fraction, "Agility to outspeed likely faster opponent"
     return 8.0 * hp_fraction, "Agility too risky at low HP"
+
+
+def _adjust_setup_score(
+    score: float,
+    reason: str,
+    *,
+    own_active: PokemonState,
+    has_reliable_ko_line: bool,
+    has_ko_line: bool,
+    incoming_threat_pct: Optional[float],
+) -> tuple[float, str]:
+    if score <= 0:
+        return score, reason
+    if has_reliable_ko_line:
+        return 0.0, f"{reason} blocked: reliable KO available"
+    if has_ko_line:
+        score *= 0.05
+        reason = f"{reason}; setup heavily deprioritized: possible KO available"
+    own_hp_pct = 100.0 * (own_active.hp_fraction if own_active.hp_fraction is not None else 1.0)
+    if incoming_threat_pct is None or own_hp_pct <= 0:
+        return score, reason
+    if incoming_threat_pct >= own_hp_pct:
+        return 0.0, f"{reason}; setup blocked: revealed attack can KO"
+    if incoming_threat_pct >= own_hp_pct * 0.75:
+        return score * 0.15, f"{reason}; setup heavily deprioritized: revealed attack is dangerous"
+    if incoming_threat_pct >= own_hp_pct * 0.50:
+        return score * 0.45, f"{reason}; setup deprioritized: revealed attack is threatening"
+    return score, reason
 
 
 def _boosts_are_capped(boosts: Dict[str, Any], own_boosts: Dict[str, int]) -> bool:
@@ -780,6 +1141,41 @@ def _has_positive_boost(boosts: Dict[str, int]) -> bool:
     return any(value > 0 for value in boosts.values())
 
 
+def _positive_boost_total(boosts: Dict[str, int]) -> int:
+    return sum(max(0, value) for value in boosts.values())
+
+
+def _has_major_setup(boosts: Dict[str, int]) -> bool:
+    return boosts.get("spa", 0) >= 2 or _positive_boost_total(boosts) >= 2
+
+
+def _has_meaningful_active_path(action_scores: Sequence[ScoredAction]) -> bool:
+    return any(action.score >= 10.0 for action in action_scores)
+
+
+def _major_setup_lock_in_active(
+    *,
+    own_active: PokemonState,
+    own_boosts: Dict[str, int],
+    action_scores: Sequence[ScoredAction],
+    incoming_threat_pct: Optional[float],
+) -> bool:
+    if not _has_major_setup(own_boosts):
+        return False
+    if not _has_meaningful_active_path(action_scores):
+        return False
+    own_hp_pct = 100.0 * (own_active.hp_fraction if own_active.hp_fraction is not None else 1.0)
+    if incoming_threat_pct is not None and incoming_threat_pct >= own_hp_pct:
+        return False
+    return True
+
+
+def _switch_boost_multiplier(boost_total: int) -> float:
+    if boost_total <= 0:
+        return 1.0
+    return max(0.05, 0.45 / (1.0 + 0.35 * boost_total))
+
+
 def _voluntary_switch_scores(
     *,
     context: Dict[str, Any],
@@ -790,42 +1186,66 @@ def _voluntary_switch_scores(
     existing_scores: Sequence[ScoredAction],
     best_damage_score: float,
     own_boosts: Dict[str, int],
+    active_has_reliable_ko: bool,
+    force_switch_only: bool,
+    active_sleep_source: Optional[str],
+    major_setup_locked: bool,
     project_root: Path,
     calc_timeout_seconds: int,
 ) -> List[ScoredAction]:
     switches = _available_switches(request)
     if not switches:
         return []
+    if active_has_reliable_ko and not force_switch_only:
+        return []
     best_existing = max((action.score for action in existing_scores), default=0.0)
-    active_asleep = own_active.status == "slp"
-    if not active_asleep and (best_existing >= 45.0 or (best_existing >= 35.0 and best_damage_score >= 20.0)):
+    active_immobile = own_active.status == "frz" or (
+        own_active.status == "slp" and active_sleep_source != SLEEP_SOURCE_REST
+    )
+    if major_setup_locked and not force_switch_only and not active_immobile:
+        return []
+    if (
+        not force_switch_only
+        and not active_immobile
+        and (best_existing >= 45.0 or (best_existing >= 35.0 and best_damage_score >= 20.0))
+    ):
         return []
 
     opponent_moves = _revealed_opponent_moves(context, public_lines)[:4]
-    if not active_asleep and not opponent_moves and best_existing >= 20.0:
+    if not force_switch_only and not active_immobile and not opponent_moves and best_existing >= 20.0:
         return []
     if (
-        not active_asleep
+        not force_switch_only
+        and not active_immobile
         and _own_active_move_count_since_switch(context, public_lines, own_active.ident) < 2
         and best_existing > 0
     ):
         return []
     after_forced_switch = _active_entered_after_own_faint(context, public_lines, own_active.ident)
-    boosted_active = _has_positive_boost(own_boosts)
+    boost_total = _positive_boost_total(own_boosts)
+    boosted_active = boost_total > 0
     scores: List[ScoredAction] = []
+    faster_ko_scores: List[ScoredAction] = []
     for choice, label, pokemon in switches:
-        raw_score = _switch_candidate_score(
+        evaluation = _switch_candidate_evaluation(
             pokemon=pokemon,
             opponent=opponent,
             opponent_moves=opponent_moves,
             project_root=project_root,
             calc_timeout_seconds=calc_timeout_seconds,
         )
-        if active_asleep:
+        if evaluation is None:
+            continue
+        raw_score = evaluation.score
+        if active_immobile:
             required_score = max(10.0, best_existing * 0.25)
             if raw_score < required_score:
                 continue
             switch_score = raw_score * 1.25 + 25.0
+        elif force_switch_only:
+            if raw_score <= 0:
+                continue
+            switch_score = raw_score + 35.0
         elif after_forced_switch:
             if best_existing >= 10.0 or raw_score < 80.0:
                 continue
@@ -833,21 +1253,197 @@ def _voluntary_switch_scores(
         else:
             required_score = 30.0 if best_existing < 10.0 else max(45.0, best_existing + 12.0)
             if boosted_active:
-                required_score = max(required_score + 20.0, best_existing + 30.0, 60.0)
+                required_score = max(
+                    required_score + 15.0 + (8.0 * boost_total),
+                    best_existing + 20.0 + (6.0 * boost_total),
+                    55.0 + (5.0 * boost_total),
+                )
             if raw_score < required_score:
                 continue
             switch_score = raw_score * 0.65
-            if boosted_active:
-                switch_score *= 0.35
-        if not active_asleep and (own_active.hp_fraction or 1.0) <= 0.20 and switch_score < best_existing + 25.0:
+        if boosted_active and not active_immobile:
+            switch_score *= _switch_boost_multiplier(boost_total)
+        if not active_immobile and (own_active.hp_fraction or 1.0) <= 0.20 and switch_score < best_existing + 25.0:
             continue
         if switch_score > 0:
-            if active_asleep:
-                reason = "sleep-clause pivot"
+            if active_immobile:
+                reason = f"{own_active.status} pivot; {evaluation.reason}"
+            elif force_switch_only:
+                reason = f"emergency pivot; {evaluation.reason}"
             else:
-                reason = "defensive pivot despite active boosts" if boosted_active else "defensive pivot"
-            scores.append(_scored_action(choice, label, switch_score, reason))
+                reason = (
+                    f"defensive pivot despite +{boost_total} active boosts; {evaluation.reason}"
+                    if boosted_active
+                    else f"defensive pivot; {evaluation.reason}"
+                )
+            action = _scored_action(choice, label, switch_score, reason)
+            if evaluation.faster and evaluation.reliable_ko and not active_has_reliable_ko:
+                faster_ko_scores.append(_scored_action(choice, label, switch_score + 140.0, f"faster reliable KO pivot; {reason}"))
+            else:
+                scores.append(action)
+    if faster_ko_scores:
+        return faster_ko_scores
     return scores
+
+
+def _least_bad_switch_scores(
+    *,
+    request: Dict[str, Any],
+    opponent: PokemonState,
+    opponent_moves: Sequence[str],
+    project_root: Path,
+    calc_timeout_seconds: int,
+    reason_prefix: str,
+) -> List[ScoredAction]:
+    switches = _available_switches(request)
+    if not switches:
+        return []
+    has_mobile_candidate = any(
+        _condition_status(pokemon.get("condition")) not in {"slp", "frz"}
+        for _, _, pokemon in switches
+    )
+    actions: List[ScoredAction] = []
+    for choice, label, pokemon in switches:
+        hp_fraction = _condition_hp_fraction(pokemon.get("condition")) or 0.0
+        if hp_fraction <= 0.0:
+            continue
+        status = _condition_status(pokemon.get("condition"))
+        if status in {"slp", "frz"} and has_mobile_candidate:
+            continue
+        candidate = _pokemon_state_from_side_slot(pokemon)
+        candidate_hp_pct = hp_fraction * 100.0
+        score = max(1.0, candidate_hp_pct * 0.20)
+        reason_parts = [reason_prefix, f"bench HP {candidate_hp_pct:.0f}%"]
+        if status in {"slp", "frz"}:
+            score *= 0.10
+            reason_parts.append(f"only immobile bench option ({status})")
+        elif status in MAJOR_STATUSES:
+            score *= 0.75
+            reason_parts.append(f"statused {status}")
+
+        candidate_speed = _effective_gen1_speed(candidate, project_root)
+        opponent_speed = _effective_gen1_speed(opponent, project_root)
+        if candidate_speed is not None and opponent_speed is not None:
+            if candidate_speed > opponent_speed:
+                score += 18.0
+                reason_parts.append("faster")
+            else:
+                score *= 0.70
+                reason_parts.append("slower")
+
+        incoming = _worst_incoming_damage_pct(
+            opponent=opponent,
+            defender=candidate,
+            move_names=opponent_moves,
+            project_root=project_root,
+            calc_timeout_seconds=calc_timeout_seconds,
+        )
+        if incoming is not None:
+            score += max(0.0, 70.0 - incoming) * 0.25
+            reason_parts.append(f"worst revealed incoming {incoming:.1f}%")
+            if incoming >= candidate_hp_pct:
+                score *= 0.25
+                reason_parts.append("known KO risk")
+            elif incoming >= candidate_hp_pct * 0.75:
+                score *= 0.45
+                reason_parts.append("heavy revealed threat")
+
+        outgoing = _best_outgoing_damage_range(
+            attacker=candidate,
+            defender=opponent,
+            move_names=_known_pokemon_moves(pokemon),
+            project_root=project_root,
+            calc_timeout_seconds=calc_timeout_seconds,
+        )
+        if outgoing is not None:
+            min_outgoing, max_outgoing = outgoing
+            target_hp_pct = 100.0 * (opponent.hp_fraction if opponent.hp_fraction is not None else 1.0)
+            score += min(100.0, max_outgoing) * 0.25
+            reason_parts.append(f"best outgoing {min_outgoing:.1f}-{max_outgoing:.1f}%")
+            if min_outgoing >= target_hp_pct:
+                score += 35.0
+                reason_parts.append("reliable KO")
+
+        actions.append(_scored_action(choice, label, max(0.01, score), ", ".join(reason_parts)))
+    return actions
+
+
+def _switch_candidate_evaluation(
+    *,
+    pokemon: Dict[str, Any],
+    opponent: PokemonState,
+    opponent_moves: Sequence[str],
+    project_root: Path,
+    calc_timeout_seconds: int,
+) -> Optional[SwitchCandidateEvaluation]:
+    hp_fraction = _condition_hp_fraction(pokemon.get("condition")) or 0.0
+    if hp_fraction <= 0.0:
+        return None
+    status = _condition_status(pokemon.get("condition"))
+    if status in {"slp", "frz"}:
+        return None
+    candidate = _pokemon_state_from_side_slot(pokemon)
+    candidate_hp_pct = hp_fraction * 100.0
+    candidate_speed = _effective_gen1_speed(candidate, project_root)
+    opponent_speed = _effective_gen1_speed(opponent, project_root)
+    faster = (
+        None
+        if candidate_speed is None or opponent_speed is None
+        else candidate_speed > opponent_speed
+    )
+    score = hp_fraction * 25.0
+    reason_parts = [f"bench HP {candidate_hp_pct:.0f}%"]
+    incoming = _worst_incoming_damage_pct(
+        opponent=opponent,
+        defender=candidate,
+        move_names=opponent_moves,
+        project_root=project_root,
+        calc_timeout_seconds=calc_timeout_seconds,
+    )
+    if incoming is not None and faster is False and incoming >= candidate_hp_pct:
+        return None
+    if incoming is not None:
+        score += max(0.0, 90.0 - incoming) * 0.55
+        reason_parts.append(f"worst revealed incoming {incoming:.1f}%")
+        if incoming >= candidate_hp_pct * 0.75:
+            score *= 0.20
+            reason_parts.append("weak to revealed threat")
+        elif incoming >= candidate_hp_pct * 0.50:
+            score *= 0.55
+            reason_parts.append("pressured by revealed threat")
+    else:
+        score += hp_fraction * 8.0
+    outgoing = _best_outgoing_damage_range(
+        attacker=candidate,
+        defender=opponent,
+        move_names=_known_pokemon_moves(pokemon),
+        project_root=project_root,
+        calc_timeout_seconds=calc_timeout_seconds,
+    )
+    reliable_ko = False
+    if outgoing is not None:
+        min_outgoing, max_outgoing = outgoing
+        target_hp_pct = 100.0 * (opponent.hp_fraction if opponent.hp_fraction is not None else 1.0)
+        reliable_ko = min_outgoing >= target_hp_pct
+        score += min(100.0, max_outgoing) * 0.45
+        reason_parts.append(f"best outgoing {min_outgoing:.1f}-{max_outgoing:.1f}%")
+        if reliable_ko:
+            score += 60.0
+            reason_parts.append("reliable KO")
+    if faster is True:
+        score += 45.0
+        reason_parts.append("faster")
+    elif faster is False:
+        reason_parts.append("slower")
+    if status in MAJOR_STATUSES:
+        score *= 0.80
+        reason_parts.append(f"statused {status}")
+    return SwitchCandidateEvaluation(
+        score=max(0.0, score),
+        reason=", ".join(reason_parts),
+        faster=faster,
+        reliable_ko=reliable_ko,
+    )
 
 
 def _switch_candidate_score(
@@ -858,39 +1454,14 @@ def _switch_candidate_score(
     project_root: Path,
     calc_timeout_seconds: int,
 ) -> float:
-    hp_fraction = _condition_hp_fraction(pokemon.get("condition")) or 0.0
-    if hp_fraction <= 0.0:
-        return 0.0
-    candidate = _pokemon_state_from_side_slot(pokemon)
-    score = hp_fraction * 25.0
-    incoming = _worst_incoming_damage_pct(
+    evaluation = _switch_candidate_evaluation(
+        pokemon=pokemon,
         opponent=opponent,
-        defender=candidate,
-        move_names=opponent_moves,
+        opponent_moves=opponent_moves,
         project_root=project_root,
         calc_timeout_seconds=calc_timeout_seconds,
     )
-    if incoming is not None:
-        score += max(0.0, 90.0 - incoming) * 0.55
-    else:
-        score += hp_fraction * 8.0
-    outgoing = _best_outgoing_damage_pct(
-        attacker=candidate,
-        defender=opponent,
-        move_names=_known_pokemon_moves(pokemon),
-        project_root=project_root,
-        calc_timeout_seconds=calc_timeout_seconds,
-    )
-    if outgoing is not None:
-        score += min(100.0, outgoing) * 0.45
-    status = _condition_status(pokemon.get("condition"))
-    if status == "slp":
-        score *= 0.15
-    elif status == "frz":
-        score *= 0.45
-    elif status in MAJOR_STATUSES:
-        score *= 0.80
-    return score
+    return evaluation.score if evaluation is not None else 0.0
 
 
 def _worst_incoming_damage_pct(
@@ -941,6 +1512,24 @@ def _best_outgoing_damage_pct(
     project_root: Path,
     calc_timeout_seconds: int,
 ) -> Optional[float]:
+    best_range = _best_outgoing_damage_range(
+        attacker=attacker,
+        defender=defender,
+        move_names=move_names,
+        project_root=project_root,
+        calc_timeout_seconds=calc_timeout_seconds,
+    )
+    return best_range[1] if best_range is not None else None
+
+
+def _best_outgoing_damage_range(
+    *,
+    attacker: PokemonState,
+    defender: PokemonState,
+    move_names: Sequence[str],
+    project_root: Path,
+    calc_timeout_seconds: int,
+) -> Optional[tuple[float, float]]:
     if not move_names:
         return None
     requests = [
@@ -962,15 +1551,19 @@ def _best_outgoing_damage_pct(
         )
     except ConfigError:
         return None
-    best = 0.0
+    best_min = 0.0
+    best_max = 0.0
     for result in response.get("results", []):
         if not isinstance(result, dict) or result.get("status") != "ok":
             continue
         payload = result.get("result")
         range_percent = payload.get("range_percent") if isinstance(payload, dict) else None
         if isinstance(range_percent, dict):
-            best = max(best, _float_value(range_percent.get("max")) or 0.0)
-    return best if best > 0 else None
+            max_pct = _float_value(range_percent.get("max")) or 0.0
+            if max_pct > best_max:
+                best_max = max_pct
+                best_min = _float_value(range_percent.get("min")) or 0.0
+    return (best_min, best_max) if best_max > 0 else None
 
 
 def _known_pokemon_moves(pokemon: Dict[str, Any]) -> List[str]:
@@ -1072,6 +1665,56 @@ def _choose_weighted(actions: Sequence[ScoredAction], rng: random.Random) -> str
     return actions[-1].choice
 
 
+def _select_action(
+    actions: Sequence[ScoredAction],
+    rng: random.Random,
+    selection_strategy: str = DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
+) -> tuple[str, List[ScoredAction]]:
+    strategy = _normalize_selection_strategy(selection_strategy)
+    weighted_actions = _actions_with_selection_strategy(actions, strategy)
+    if not weighted_actions:
+        raise ConfigError("Cannot select from an empty custom-bot action list.")
+    if strategy == SELECTION_ARGMAX:
+        best_score = max(action.score for action in weighted_actions)
+        tied = [action for action in weighted_actions if action.score == best_score]
+        return rng.choice(tied).choice, weighted_actions
+    return _choose_weighted(weighted_actions, rng), weighted_actions
+
+
+def _actions_with_selection_strategy(
+    actions: Sequence[ScoredAction],
+    selection_strategy: str = DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
+) -> List[ScoredAction]:
+    strategy = _normalize_selection_strategy(selection_strategy)
+    if strategy == SELECTION_ARGMAX:
+        best_score = max((action.score for action in actions), default=0.0)
+        return [
+            replace(action, weight=1.0 if action.score == best_score and best_score > 0 else 0.0)
+            for action in actions
+        ]
+    return [
+        replace(action, weight=_selection_weight(action.score, strategy))
+        for action in actions
+    ]
+
+
+def _selection_weight(score: float, selection_strategy: str) -> float:
+    safe_score = max(0.0, float(score))
+    if selection_strategy == SELECTION_WEIGHTED_LINEAR:
+        return safe_score
+    if selection_strategy == SELECTION_WEIGHTED_CUBE:
+        return safe_score ** 3
+    return safe_score * safe_score
+
+
+def _normalize_selection_strategy(selection_strategy: str) -> str:
+    strategy = str(selection_strategy or DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY).strip().lower()
+    if strategy not in CUSTOM_BOT_SELECTION_STRATEGIES:
+        allowed = ", ".join(CUSTOM_BOT_SELECTION_STRATEGIES)
+        raise ConfigError(f"Unknown custom bot selection strategy {selection_strategy!r}. Available: {allowed}.")
+    return strategy
+
+
 def _selection_pool(actions: Sequence[ScoredAction]) -> List[ScoredAction]:
     if len(actions) <= 1:
         return list(actions)
@@ -1099,6 +1742,7 @@ def _notes(
     actions: Sequence[ScoredAction],
     fallback_reason: Optional[str],
     warnings: Optional[Sequence[str]] = None,
+    selection_strategy: str = DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
 ) -> str:
     if fallback_reason:
         return f"custom-bot fallback: {fallback_reason}; selected {decision}."
@@ -1112,7 +1756,12 @@ def _notes(
             f"p={probability:.0f}%, {action.reason}"
         )
     warning_text = " ".join(warnings or [])
-    score_text = f"custom-bot gen1randombattle weighted scores; selected {decision}. " + "; ".join(parts)
+    strategy = _normalize_selection_strategy(selection_strategy)
+    score_text = (
+        f"custom-bot gen1randombattle weighted scores (selection={strategy}); "
+        f"selected {decision}. "
+        + "; ".join(parts)
+    )
     return f"{warning_text} {score_text}".strip()
 
 
@@ -1287,6 +1936,70 @@ def _public_lines(context: Dict[str, Any], capture_payload: Optional[Dict[str, A
     return [line for line in recent if isinstance(line, str)] if isinstance(recent, list) else []
 
 
+def _active_sleep_source(
+    context: Dict[str, Any],
+    public_lines: Sequence[str],
+    own_active: PokemonState,
+) -> Optional[str]:
+    if own_active.status != "slp":
+        return None
+    player_slot = _effective_player_slot(context)
+    opponent_slot = _opponent_slot(player_slot)
+    source: Optional[str] = None
+    last_move: Optional[tuple[str, str, str]] = None
+    saw_recent_own_rest = False
+    for line in public_lines:
+        parts = line.split("|") if isinstance(line, str) else []
+        if len(parts) >= 4 and parts[1] in {"switch", "drag", "replace"} and _same_ident(parts[2], own_active.ident):
+            source = None
+            last_move = None
+            saw_recent_own_rest = False
+            continue
+        if len(parts) >= 4 and parts[1] == "move":
+            actor = parts[2]
+            move_name = parts[3]
+            target = parts[4] if len(parts) > 4 else ""
+            last_move = (actor, move_name, target)
+            if _same_ident(actor, own_active.ident) and _normalize_move_id(move_name) == "rest":
+                saw_recent_own_rest = True
+            continue
+        if len(parts) >= 4 and parts[1] == "-status" and parts[3] == "slp" and _same_ident(parts[2], own_active.ident):
+            if _status_line_has_rest_source(parts):
+                source = SLEEP_SOURCE_REST
+            elif (
+                last_move is not None
+                and _same_ident(last_move[0], own_active.ident)
+                and _normalize_move_id(last_move[1]) == "rest"
+            ):
+                source = SLEEP_SOURCE_REST
+            elif (
+                last_move is not None
+                and _ident_matches_slot(last_move[0], opponent_slot)
+                and _same_ident(last_move[2], parts[2])
+                and _normalize_move_id(last_move[1]) in SLEEP_MOVES
+            ):
+                source = SLEEP_SOURCE_OPPONENT
+            else:
+                source = SLEEP_SOURCE_UNKNOWN
+            continue
+        if len(parts) >= 4 and parts[1] == "-curestatus" and parts[3] == "slp" and _same_ident(parts[2], own_active.ident):
+            source = None
+            saw_recent_own_rest = False
+            continue
+        if len(parts) >= 3 and parts[1] == "faint" and _same_ident(parts[2], own_active.ident):
+            source = None
+            saw_recent_own_rest = False
+    if source is not None:
+        return source
+    if saw_recent_own_rest:
+        return SLEEP_SOURCE_REST
+    return SLEEP_SOURCE_UNKNOWN
+
+
+def _status_line_has_rest_source(parts: Sequence[str]) -> bool:
+    return any("move: rest" in part.lower() for part in parts[4:])
+
+
 def _sleep_clause_active(context: Dict[str, Any], public_lines: Sequence[str]) -> bool:
     player_slot = _effective_player_slot(context)
     opponent_slot = _opponent_slot(player_slot)
@@ -1316,17 +2029,13 @@ def _sleep_clause_active(context: Dict[str, Any], public_lines: Sequence[str]) -
             continue
         if (
             len(parts) >= 3
-            and parts[1] in {"faint", "-curestatus"}
+            and parts[1] == "faint"
             and _ident_matches_slot(parts[2], opponent_slot)
         ):
             asleep.pop(_identity_key(parts[2]), None)
-        if (
-            len(parts) >= 5
-            and parts[1] in {"switch", "drag", "replace"}
-            and _ident_matches_slot(parts[2], opponent_slot)
-        ):
-            status = _condition_status(parts[4])
-            if status != "slp":
+        if len(parts) >= 3 and parts[1] == "-curestatus" and _ident_matches_slot(parts[2], opponent_slot):
+            cured_status = parts[3] if len(parts) > 3 else ""
+            if cured_status == "slp":
                 asleep.pop(_identity_key(parts[2]), None)
     return any(asleep.values())
 
@@ -1392,6 +2101,10 @@ def _revealed_opponent_moves(context: Dict[str, Any], public_lines: Sequence[str
                 seen.add(key)
                 moves.append(move_name)
     return moves
+
+
+def _counter_revealed(opponent_moves: Sequence[str]) -> bool:
+    return any(_normalize_move_id(move) == "counter" for move in opponent_moves)
 
 
 def _active_entered_after_own_faint(
@@ -1515,6 +2228,32 @@ def _estimated_gen1_speed(pokemon: PokemonState, project_root: Path) -> Optional
         return None
     level = _calc_ref_level(pokemon.calc_ref) or 100
     return int(((((base_speed + 15) * 2 + 63) * level) // 100) + 5)
+
+
+def _effective_gen1_speed(
+    pokemon: PokemonState,
+    project_root: Path,
+    *,
+    speed_boost: int = 0,
+) -> Optional[float]:
+    speed = _estimated_gen1_speed(pokemon, project_root)
+    if speed is None:
+        return None
+    return _effective_speed_value(speed, status=pokemon.status, speed_boost=speed_boost)
+
+
+def _effective_speed_value(speed: float, *, status: Optional[str], speed_boost: int = 0) -> float:
+    modified = float(speed) * _boost_multiplier(speed_boost)
+    if status == "par" and speed_boost <= 0:
+        modified /= 4.0
+    return modified
+
+
+def _boost_multiplier(boost: int) -> float:
+    boost = max(-BOOST_CAP, min(BOOST_CAP, boost))
+    if boost >= 0:
+        return (2.0 + boost) / 2.0
+    return 2.0 / (2.0 - boost)
 
 
 def _base_speed_for_species(species: str, project_root: Path) -> Optional[int]:

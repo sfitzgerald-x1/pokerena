@@ -52,7 +52,28 @@ from .calc import (
     sample_damage_calc_payload,
 )
 from .config import ConfigError, load_agents_config, load_server_config
-from .custom_bot import decide_custom_bot_from_files, emit_custom_bot_decision
+from .custom_bot import (
+    CUSTOM_BOT_SELECTION_STRATEGIES,
+    DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
+    decide_custom_bot_from_files,
+    emit_custom_bot_decision,
+)
+from .custom_bot_claude import (
+    DEFAULT_CLAUDE_OVERRIDE_MODEL,
+    DEFAULT_CLAUDE_OVERRIDE_TIMEOUT_SECONDS,
+    decide_custom_bot_claude_from_files,
+    emit_custom_bot_claude_decision,
+)
+from .eval_tracker import (
+    DEFAULT_EVAL_VIEWER_HOST,
+    DEFAULT_EVAL_VIEWER_PORT,
+    eval_viewer_url,
+    run_max_damage_vs_custom_eval,
+    run_pool_eval,
+    serve_eval_viewer,
+)
+from .max_damage_bot import decide_max_damage_bot_from_files, emit_max_damage_bot_decision
+from .random_bot import decide_random_bot_from_files, emit_random_bot_decision
 from .runtime_env import filtered_runtime_env
 from .showdown import build_server_command, node_version, prepare_runtime
 from .transcript import (
@@ -130,10 +151,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return run_agent_decide(args)
             if args.agent_command == "custom-bot":
                 return run_agent_custom_bot(args)
+            if args.agent_command == "custom-bot-claude":
+                return run_agent_custom_bot_claude(args)
+            if args.agent_command == "max-damage-bot":
+                return run_agent_max_damage_bot(args)
+            if args.agent_command == "random-bot":
+                return run_agent_random_bot(args)
             if args.agent_command == "sim-battle":
                 return run_agent_sim_battle(args)
             if args.agent_command == "showdown-client":
                 return run_agent_showdown_client(args)
+        if args.command == "eval":
+            if args.eval_command == "viewer":
+                return run_eval_viewer(args)
+            if args.eval_command == "max-damage-vs-custom":
+                return run_eval_max_damage_vs_custom(args)
+            if args.eval_command == "pool":
+                return run_eval_pool(args)
     except ConfigError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -266,10 +300,105 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional seed for deterministic weighted-random decisions.",
     )
     custom_bot_parser.add_argument(
+        "--selection-strategy",
+        choices=CUSTOM_BOT_SELECTION_STRATEGIES,
+        default=DEFAULT_CUSTOM_BOT_SELECTION_STRATEGY,
+        help="How to select among scored custom-bot actions.",
+    )
+    custom_bot_parser.add_argument(
         "--calc-timeout",
         type=int,
         default=DEFAULT_CALC_TIMEOUT_SECONDS,
         help="How long to wait for local calc worker damage and move metadata requests.",
+    )
+
+    custom_bot_claude_parser = agent_subparsers.add_parser(
+        "custom-bot-claude",
+        help="Run the Gen 1 custom bot, then let Claude Code review and optionally override it.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--context",
+        default=None,
+        help="Path to turn-context JSON. Defaults to POKERENA_TURN_CONTEXT_PATH.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--capture",
+        default=None,
+        help="Optional path to battle-capture JSON. Defaults to POKERENA_BATTLE_CAPTURE_PATH.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--seed",
+        default=None,
+        help="Optional seed for deterministic custom-bot baseline decisions.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--calc-timeout",
+        type=int,
+        default=DEFAULT_CALC_TIMEOUT_SECONDS,
+        help="How long to wait for local calc worker damage and move metadata requests.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--claude-command",
+        default="claude",
+        help="Claude Code executable to invoke.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--model",
+        default=DEFAULT_CLAUDE_OVERRIDE_MODEL,
+        help="Claude model passed to Claude Code.",
+    )
+    custom_bot_claude_parser.add_argument(
+        "--claude-timeout",
+        type=int,
+        default=DEFAULT_CLAUDE_OVERRIDE_TIMEOUT_SECONDS,
+        help="How long to wait for Claude Code override review.",
+    )
+
+    max_damage_bot_parser = agent_subparsers.add_parser(
+        "max-damage-bot",
+        help="Run Pokerena's deterministic Gen 1 random battle max-damage bot hook.",
+    )
+    max_damage_bot_parser.add_argument(
+        "--context",
+        default=None,
+        help="Path to turn-context JSON. Defaults to POKERENA_TURN_CONTEXT_PATH.",
+    )
+    max_damage_bot_parser.add_argument(
+        "--capture",
+        default=None,
+        help="Optional path to battle-capture JSON. Defaults to POKERENA_BATTLE_CAPTURE_PATH.",
+    )
+    max_damage_bot_parser.add_argument(
+        "--calc-timeout",
+        type=int,
+        default=DEFAULT_CALC_TIMEOUT_SECONDS,
+        help="How long to wait for local calc worker damage and move metadata requests.",
+    )
+
+    random_bot_parser = agent_subparsers.add_parser(
+        "random-bot",
+        help="Run Pokerena's Gen 1 random battle random-move baseline bot hook.",
+    )
+    random_bot_parser.add_argument(
+        "--context",
+        default=None,
+        help="Path to turn-context JSON. Defaults to POKERENA_TURN_CONTEXT_PATH.",
+    )
+    random_bot_parser.add_argument(
+        "--capture",
+        default=None,
+        help="Optional path to battle-capture JSON. Defaults to POKERENA_BATTLE_CAPTURE_PATH.",
+    )
+    random_bot_parser.add_argument(
+        "--seed",
+        default=None,
+        help="Optional seed for deterministic random decisions.",
+    )
+    random_bot_parser.add_argument(
+        "--switch-chance",
+        type=float,
+        default=0.10,
+        help="Chance to make a voluntary random switch on move turns when legal.",
     )
 
     sim_parser = agent_subparsers.add_parser(
@@ -350,6 +479,68 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="How many invalid agent decisions to tolerate before falling back to the built-in policy.",
+    )
+
+    eval_parser = subparsers.add_parser("eval", help="Run and inspect local simulation evals.")
+    eval_subparsers = eval_parser.add_subparsers(dest="eval_command")
+
+    eval_viewer_parser = eval_subparsers.add_parser(
+        "viewer",
+        help="Serve the local eval tracker website.",
+    )
+    eval_viewer_parser.add_argument(
+        "--host",
+        default=DEFAULT_EVAL_VIEWER_HOST,
+        help="Host to bind the eval tracker website to.",
+    )
+    eval_viewer_parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_EVAL_VIEWER_PORT,
+        help="Port for the eval tracker website.",
+    )
+
+    eval_run_parser = eval_subparsers.add_parser(
+        "max-damage-vs-custom",
+        help="Run Gen 1 max-damage bot against the custom bot and publish live eval progress.",
+    )
+    _add_common_config_arguments(eval_run_parser)
+    eval_run_parser.add_argument(
+        "--games",
+        type=int,
+        default=100,
+        help="Number of simulate-battle games to run.",
+    )
+    eval_run_parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional stable run id for the eval tracker.",
+    )
+
+    eval_pool_parser = eval_subparsers.add_parser(
+        "pool",
+        help="Run a Gen 1 round-robin eval across a bot pool and publish live progress.",
+    )
+    _add_common_config_arguments(eval_pool_parser)
+    eval_pool_parser.add_argument(
+        "--games-per-pair",
+        type=int,
+        default=100,
+        help="Number of simulate-battle games to run for each unordered bot pair.",
+    )
+    eval_pool_parser.add_argument(
+        "--bots",
+        nargs="+",
+        default=["custom-bot", "max-damage-bot", "random-bot"],
+        help=(
+            "Bot ids to include. Available: custom-bot, custom-bot-argmax, "
+            "custom-bot-cube, custom-bot-linear, max-damage-bot, random-bot."
+        ),
+    )
+    eval_pool_parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional stable run id for the eval tracker.",
     )
 
     return parser
@@ -676,8 +867,77 @@ def run_agent_custom_bot(args: argparse.Namespace) -> int:
         seed=args.seed,
         project_root=detect_project_root(),
         calc_timeout_seconds=args.calc_timeout,
+        selection_strategy=args.selection_strategy,
     )
     emit_custom_bot_decision(decision)
+    return 0
+
+
+def run_agent_custom_bot_claude(args: argparse.Namespace) -> int:
+    decision = decide_custom_bot_claude_from_files(
+        context_path=args.context,
+        capture_path=args.capture,
+        seed=args.seed,
+        project_root=detect_project_root(),
+        calc_timeout_seconds=args.calc_timeout,
+        claude_command=args.claude_command,
+        model=args.model,
+        claude_timeout_seconds=args.claude_timeout,
+    )
+    emit_custom_bot_claude_decision(decision)
+    return 0
+
+
+def run_agent_max_damage_bot(args: argparse.Namespace) -> int:
+    decision = decide_max_damage_bot_from_files(
+        context_path=args.context,
+        capture_path=args.capture,
+        project_root=detect_project_root(),
+        calc_timeout_seconds=args.calc_timeout,
+    )
+    emit_max_damage_bot_decision(decision)
+    return 0
+
+
+def run_agent_random_bot(args: argparse.Namespace) -> int:
+    decision = decide_random_bot_from_files(
+        context_path=args.context,
+        capture_path=args.capture,
+        seed=args.seed,
+        switch_chance=args.switch_chance,
+    )
+    emit_random_bot_decision(decision)
+    return 0
+
+
+def run_eval_viewer(args: argparse.Namespace) -> int:
+    print(f"Eval tracker: {eval_viewer_url(args.host, args.port)}")
+    serve_eval_viewer(project_root=Path.cwd(), host=args.host, port=args.port)
+    return 0
+
+
+def run_eval_max_damage_vs_custom(args: argparse.Namespace) -> int:
+    state = run_max_damage_vs_custom_eval(
+        project_root=Path.cwd(),
+        config_path=args.config,
+        agents_config_path=args.agents_config,
+        games=args.games,
+        run_id=args.run_id,
+    )
+    print(json.dumps({key: value for key, value in state.items() if key != "game_results"}, indent=2))
+    return 0
+
+
+def run_eval_pool(args: argparse.Namespace) -> int:
+    state = run_pool_eval(
+        project_root=Path.cwd(),
+        config_path=args.config,
+        agents_config_path=args.agents_config,
+        games_per_pair=args.games_per_pair,
+        bot_ids=args.bots,
+        run_id=args.run_id,
+    )
+    print(json.dumps({key: value for key, value in state.items() if key != "game_results"}, indent=2))
     return 0
 
 
