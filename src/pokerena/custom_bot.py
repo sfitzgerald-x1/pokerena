@@ -46,6 +46,7 @@ SLEEP_MOVES = {"hypnosis", "lovelykiss", "sing", "sleeppowder", "spore"}
 CHARGE_MOVE_IDS = {"solarbeam", "skyattack", "skullbash"}
 DEFAULT_CHARGE_MOVE_MULTIPLIER = 0.45
 CHARGE_MOVE_MULTIPLIERS = {"skyattack": 0.12}
+REDUNDANT_HYPER_BEAM_KO_MULTIPLIER = 0.35
 SELF_KO_MOVE_IDS = {"explosion", "selfdestruct"}
 RECOVERY_MOVE_IDS = {"recover", "softboiled"}
 BOOST_CAP = 6
@@ -288,6 +289,18 @@ def build_custom_bot_plan(
         ):
             score *= 0.10
             reason = f"{reason}; inaccurate move heavily deprioritized: 100% accurate KO available"
+        if (
+            score > 0
+            and _metadata_id(candidate.metadata) == "hyperbeam"
+            and candidate.choice in reliable_ko_choices
+            and _has_equal_or_more_accurate_non_hyper_beam_reliable_ko(
+                candidate,
+                candidates=move_candidates,
+                reliable_ko_choices=reliable_ko_choices,
+            )
+        ):
+            score *= REDUNDANT_HYPER_BEAM_KO_MULTIPLIER
+            reason = f"{reason}; safer non-Hyper Beam KO available"
         if score > 0 and own_active.status == "slp":
             score *= 0.20
             reason = f"{reason}; active asleep"
@@ -807,6 +820,23 @@ def _accurate_reliable_ko_choices(
         for candidate in candidates
         if candidate.choice in reliable_choices and _accuracy_factor(candidate.metadata) >= 1.0
     }
+
+
+def _has_equal_or_more_accurate_non_hyper_beam_reliable_ko(
+    candidate: MoveCandidate,
+    *,
+    candidates: Sequence[MoveCandidate],
+    reliable_ko_choices: set[str],
+) -> bool:
+    candidate_accuracy = _accuracy_factor(candidate.metadata)
+    for other in candidates:
+        if other.choice == candidate.choice or other.choice not in reliable_ko_choices:
+            continue
+        if _metadata_id(other.metadata) == "hyperbeam":
+            continue
+        if _accuracy_factor(other.metadata) >= candidate_accuracy:
+            return True
+    return False
 
 
 def _hyper_beam_recharge_risk_multiplier(

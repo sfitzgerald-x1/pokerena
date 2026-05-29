@@ -710,6 +710,56 @@ class CustomBotTest(unittest.TestCase):
         by_choice = {action.choice: action for action in plan.actions}
         self.assertLess(by_choice["move 1"].score, by_choice["move 2"].score)
 
+    def test_hyper_beam_ko_is_deprioritized_when_equal_accuracy_move_also_kos(self) -> None:
+        context = _context(
+            [
+                {"move": "Hyper Beam", "id": "hyperbeam", "disabled": False},
+                {"move": "Body Slam", "id": "bodyslam", "disabled": False},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|30/100",
+                "|turn|1",
+            ],
+        )
+        metadata = {
+            "Hyper Beam": _metadata("Hyper Beam", base_power=150, accuracy=100, recharge=True),
+            "Body Slam": _metadata("Body Slam", base_power=85, accuracy=100),
+        }
+        ranges = {"Hyper Beam": (80, 95), "Body Slam": (35, 40)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 2"})
+        self.assertEqual(plan.decision, "move 2")
+
+    def test_hyper_beam_ko_is_not_deprioritized_for_less_accurate_alternative_ko(self) -> None:
+        context = _context(
+            [
+                {"move": "Hyper Beam", "id": "hyperbeam", "disabled": False},
+                {"move": "Blizzard", "id": "blizzard", "disabled": False},
+            ],
+            recent_public_events=[
+                "|gen|1",
+                "|switch|p1a: Venusaur|Venusaur, L80|100/100",
+                "|switch|p2a: Starmie|Starmie, L80|30/100",
+                "|turn|1",
+            ],
+        )
+        metadata = {
+            "Hyper Beam": _metadata("Hyper Beam", base_power=150, accuracy=100, recharge=True),
+            "Blizzard": _metadata("Blizzard", base_power=120, accuracy=90, move_type="Ice"),
+        }
+        ranges = {"Hyper Beam": (80, 95), "Blizzard": (35, 40)}
+
+        with _patched_calc(metadata, ranges):
+            plan = build_custom_bot_plan(context, project_root=Path.cwd(), rng=random.Random(5))
+
+        self.assertEqual({action.choice for action in plan.actions}, {"move 1"})
+        self.assertEqual(plan.decision, "move 1")
+
     def test_explosion_is_penalized_from_high_hp_without_ko(self) -> None:
         context = _context(
             [
